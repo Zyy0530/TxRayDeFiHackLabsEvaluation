@@ -2,7 +2,7 @@
 
 ## Incident Overview & TL;DR
 
-On BSC (chainid 56), an adversary-controlled helper contract `0xbfd7280b11466bc717eb0053a78675aed2c2e388` abused a publicly accessible mint function on ERC20 token `0xc3b1b45e5784a8efececfc0be2e28247d3f49963` to create a very large amount of that token. The helper then routed the freshly minted tokens through an AMM pair `0x794ed5e8251c4a8d321ca263d9c0bc8ecf5fa1ff`, swapping them for a substantial quantity of a stablecoin-like ERC20 token `0x55d398326f99059ff775485246999027b3197955`.
+On BSC (chainid 56), an adversary-controlled helper contract `0xbfd7280b11466bc717eb0053a78675aed2c2e388` abused a publicly accessible mint function on ERC20 token `0xc3b1b45e5784a8efececfc0be2e28247d3f49963` to crewasdZXcvb vb  vb ge amount of that token. The helper then routed the freshly minted tokens through an AMM pair `0x794ed5e8251c4a8d321ca263d9c0bc8ecf5fa1ff`, swapping them for a substantial quantity of a stablecoin-like ERC20 token `0x55d398326f99059ff775485246999027b3197955`.
 
 The root cause is a protocol-level bug in token `0xc3b1…`: it exposes a publicly callable mint function (selector `0xa7c861da`) that directly increases `totalSupply` and a chosen recipient’s balance without any access control. Any unprivileged caller can therefore mint arbitrary amounts of the token and use AMM liquidity pools to drain external collateral (here, stablecoin `0x55d3…`) backing the pool.
 
