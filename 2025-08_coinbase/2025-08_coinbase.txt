@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-08_coinbase]
+- txhashes (tx, chainid):
+  - 0x33b2cb5bc3c0ccb97f0cc21e231ecb6457df242710dfce8d1b68935f0e05773b, 1
+  - 0x8df54ebe76c09cda530f1fccb591166c716000ec95ee5cb37dff997b2ee269f2, 1

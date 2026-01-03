@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-08_Grizzifi]
+- txhashes (tx, chainid):
+  - 0x36438165d701c883fd9a03631ee0cdeec35a138153720006ab59264db7e075c1, 56
+  - 0x4302de51c8126e7934da9be1affbde73e5153fe1f9d0200a738a269fe07d22c7, 56
