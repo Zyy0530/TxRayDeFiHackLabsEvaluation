@@ -1,0 +1,4 @@
+[DeFiHackLabs_2024-10_BUBAI]
+- txhashes (tx, chainid):
+  - 0x1b4730e715286862042def956d5aaa6a53203ee02b97ea913de73fa462e48f90, 1
+  - 0x872fcfcfd2e61ab5ec848f5e1a75b75f471bdb8c808c06388434e7179a9e40db, 1

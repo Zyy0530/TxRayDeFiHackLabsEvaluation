@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-12_LABUBU]
+- txhashes (tx, chainid):
+  - 0xb06df371029456f2bf2d2edb732d1f3c8292d4271d362390961fdcc63a2382de, 56

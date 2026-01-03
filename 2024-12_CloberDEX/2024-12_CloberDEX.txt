@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-12_CloberDEX]
+- txhashes (tx, chainid):
+  - 0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04, 8453

@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-11_DeltaPrime]
+- txhashes (tx, chainid):
+  - 0x6a2f989b5493b52ffc078d0a59a3bf9727d134b403aa6e0bf309fd513a728f7f, 42161

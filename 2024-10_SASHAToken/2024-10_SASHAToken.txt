@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-10_SASHAToken]
+- txhashes (tx, chainid):
+  - 0xd9fdc7d03eec28fc2453c5fa68eff82d4c297f436a6a5470c54ca3aecd2db17e, 1

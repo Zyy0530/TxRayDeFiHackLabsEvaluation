@@ -1,0 +1,3 @@
+[DeFiHackLabs_2025-01_Ast]
+- txhashes (tx, chainid):
+  - 0x80dd9362d211722b578af72d551f0a68e0dc1b1e077805353970b2f65e793927, 56

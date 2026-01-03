@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-12_Moonhacker]
+- txhashes (tx, chainid):
+  - 0xd12016b25d7aef681ade3dc3c9d1a1cc12f35b2c99953ff0e0ee23a59454c4fe, 10

@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-04_BTNFT]
+- txhashes (tx, chainid):
+  - 0x1e90cbff665c43f91d66a56b4aa9ba647486a5311bb0b4381de4d653a9d8237d, 56
+  - 0x7978c002d12be9b748770cc31cbaa1b9f3748e4083c9f419d7a99e2e07f4d75f, 56

@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-10_MorphoBlue]
+- txhashes (tx, chainid):
+  - 0x256979ae169abb7fbbbbc14188742f4b9debf48b48ad5b5207cadcc99ccb493b, 1

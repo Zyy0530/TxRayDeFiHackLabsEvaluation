@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-10_P719Token]
+- txhashes (tx, chainid):
+  - 0x9afcac8e82180fa5b2f346ca66cf6eb343cd1da5a2cd1b5117eb7eaaebe953b3, 56

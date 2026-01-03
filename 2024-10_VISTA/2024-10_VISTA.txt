@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-10_VISTA]
+- txhashes (tx, chainid):
+  - 0x84c385aab658d86b64e132e8db0c092756d5a9331a1131bf05f8214d08efba56, 56

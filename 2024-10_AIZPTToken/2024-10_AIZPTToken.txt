@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-10_AIZPTToken]
+- txhashes (tx, chainid):
+  - 0x5e694707337cca979d18f9e45f40e81d6ca341ed342f1377f563e779a746460d, 56

@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-01_sorraStaking]
+- txhashes (tx, chainid):
+  - 0x6439d63cc57fb68a32ea8ffd8f02496e8abad67292be94904c0b47a4d14ce90d, 1
+  - 0x72a252277e30ea6a37d2dc9905c280f3bc389b87f72b81a59aa8f50baebd8eaa, 1

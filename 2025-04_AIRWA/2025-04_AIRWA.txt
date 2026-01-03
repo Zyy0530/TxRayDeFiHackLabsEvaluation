@@ -1,0 +1,3 @@
+[DeFiHackLabs_2025-04_AIRWA]
+- txhashes (tx, chainid):
+  - 0x5cf050cba486ec48100d5e5ad716380660e8c984d80f73ba888415bb540851a4, 56

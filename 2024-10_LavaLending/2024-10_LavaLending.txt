@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-10_LavaLending]
+- txhashes (tx, chainid):
+  - 0xb5cfa4ae4d6e459ba285fec7f31caf8885e2285a0b4ff62f66b43e280c947216, 42161

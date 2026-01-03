@@ -1,0 +1,5 @@
+[DeFiHackLabs_2025-05_Corkprotocol]
+- txhashes (tx, chainid):
+  - 0x89ba58edaf9f40dc0c781c40351ba392be31263faa6be3a29c2ee152f271df6d, 1
+  - 0xb54308956e58fc124503e01eaae153e54eb738fd188e476460dba78e61793b45, 1
+  - 0xfd89cdd0be468a564dd525b222b728386d7c6780cf7b2f90d2b54493be09f64d, 1

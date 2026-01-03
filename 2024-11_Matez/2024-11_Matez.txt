@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-11_Matez]
+- txhashes (tx, chainid):
+  - 0x840b0dc64dbb91e8aba524f67189f639a0bc94ee9256c57d79083bb3fd46ec91, 56

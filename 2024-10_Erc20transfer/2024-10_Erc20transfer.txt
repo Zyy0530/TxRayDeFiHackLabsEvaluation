@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-10_Erc20transfer]
+- txhashes (tx, chainid):
+  - 0x7f2540af4a1f7b0172a46f5539ebf943dd5418422e4faa8150d3ae5337e92172, 1

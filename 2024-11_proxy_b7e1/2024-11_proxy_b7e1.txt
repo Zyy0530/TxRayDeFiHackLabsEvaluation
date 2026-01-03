@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-11_proxy_b7e1]
+- txhashes (tx, chainid):
+  - 0x864d33d006e5c39c9ee8b35be5ae05a2013e556be3e078e2881b0cc6281bb265, 56

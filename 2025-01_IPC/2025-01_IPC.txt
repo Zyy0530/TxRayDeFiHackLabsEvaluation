@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-01_IPC]
+- txhashes (tx, chainid):
+  - 0x3a3683119e1801821faa15c319cb9c8fb3fcf6ee92b1904a829d82c432e09a44, 56
+  - 0x5ef1edb9749af6cec511741225e6d47103e0b647d1e41e08649caaff66942a91, 56

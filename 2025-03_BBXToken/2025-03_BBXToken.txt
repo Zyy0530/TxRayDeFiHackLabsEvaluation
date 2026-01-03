@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-03_BBXToken]
+- txhashes (tx, chainid):
+  - 0x0dd486368444598610239b934dd9e8c6474a06d11380d1cfec4d91568b5ac581, 56
+  - 0xf7019e1232704c3ede4ecf00b79ccf647b2cb3718b9f6972e70dc7c5170e3f91, 56

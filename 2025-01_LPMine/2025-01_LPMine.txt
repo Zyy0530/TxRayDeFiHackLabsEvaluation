@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-01_LPMine]
+- txhashes (tx, chainid):
+  - 0x00c5a772a58b117f142b2cbc8721b80d145ef7a910043ad08439863d0e78e300, 56
+  - 0x11c1ef2c61f5a2e41d570a1547d2d891bf916853ddd94e32097e86bcdd21cb4c, 56

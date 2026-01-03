@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-11_ChiSale]
+- txhashes (tx, chainid):
+  - 0x586a2a4368a1a45489a8a9b4273509b524b672c33e6c544d2682771b44f05e87, 1

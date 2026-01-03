@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-01_Paribus]
+- txhashes (tx, chainid):
+  - 0x43aa42d2f11afe42832a9619bc8066dfb83a921798b91eaf9d0345dd27dcfb06, 42161
+  - 0xf5e753d3da60db214f2261343c1e1bc46e674d2fa4b7a953eaf3c52123aeebd2, 42161

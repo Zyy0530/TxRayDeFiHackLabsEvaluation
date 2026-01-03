@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-12_SlurpyCoin]
+- txhashes (tx, chainid):
+  - 0x6c729ee778332244de099ba0cb68808fcd7be4a667303fcdf2f54dd4b3d29051, 56

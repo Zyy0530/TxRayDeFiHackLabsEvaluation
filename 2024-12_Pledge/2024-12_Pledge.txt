@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-12_Pledge]
+- txhashes (tx, chainid):
+  - 0x63ac9bc4e53dbcfaac3a65cb90917531cfdb1c79c0a334dda3f06e42373ff3a0, 56

@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-11_VRug]
+- txhashes (tx, chainid):
+  - 0x5e151627dc06ec4f2db5be2f48248f320ad3450aba42b1bbd00131bcbaa4f0ae, 1

@@ -1,0 +1,3 @@
+[DeFiHackLabs_2024-12_JHY]
+- txhashes (tx, chainid):
+  - 0xb6a9055e3ce7f006391760fbbcc4e4bc8df8228dc47a8bb4ff657370ccc49256, 56
