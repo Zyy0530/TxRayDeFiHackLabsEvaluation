@@ -1,0 +1,11 @@
+{
+    "is_act":true,
+    "root_cause": {
+        "discovered": false,
+        "aligned": false
+    },
+    "poc": {
+        "generated": false,
+        "runnable": false
+    }
+}
