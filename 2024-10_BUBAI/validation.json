@@ -1,5 +1,5 @@
 {
-    "is_act":true,
+    "is_act":false,
     "root_cause": {
         "discovered": true,
         "aligned": true
