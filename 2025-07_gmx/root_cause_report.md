@@ -1,140 +1,273 @@
 ## Incident Overview TL;DR
 
-The analyzed Arbitrum transactions are a GMX user funding an increase order via a router and a GMX keeper executing that increase order with a configured execution fee. On-chain traces, balance diffs, and verified GMX contract code show that these transactions follow the intended protocol design. There is no exploit, protocol failure, or ACT opportunity; the system operates as designed with allowlisted keepers executing user orders and receiving documented execution fees.
+On Arbitrum, a GMX user created an increase order that paid a 0.000300000000000000 ETH execution fee into the GMX OrderBook contract. A whitelisted keeper EOA `0xd4266f8f82f7405429ee18559e548979d49160f3` then executed that order via `PositionManager.executeIncreaseOrder`, which routed to `OrderBook.executeIncreaseOrder` and paid the entire execution fee to the keeper as ETH. After paying 20908464018000 wei of gas, the keeper realised a deterministic net profit of 279091535982000 wei in ETH. From the same pre-state, any EOA in the `isOrderKeeper` set that can call `executeIncreaseOrder` with itself as `feeReceiver` against this stored order realises the same net ETH profit while the order remains valid and price conditions hold.
+
+The technical root cause is that GMX exposes `OrderBook.executeIncreaseOrder` as an external nonReentrant function with no `msg.sender`-based access control and a caller-specified `feeReceiver` parameter, and the GMX Router authenticates plugins using `CALLER` rather than `ORIGIN`. Once a user-funded order with a positive `executionFee` is stored in `OrderBook`, executing that order pays the entire `executionFee` to the chosen `feeReceiver`, creating a deterministic MEV-style ACT opportunity for authorised keepers or searchers.
 
 ## Key Background
 
-GMX on Arbitrum uses an OrderBook and PositionManager architecture for leveraged positions. Users fund increase or decrease orders through a router that interacts with the GMX OrderBook and Vault. Collateral is held in the OrderBook until an allowlisted keeper executes the order via PositionManager functions such as `executeIncreaseOrder` or `executeDecreaseOrder`.
-
-Execution fees for GMX orders are explicitly configured at order creation. When a keeper later executes an order, the GMX contracts pay the configured execution fee to a keeper address that is registered in PositionManager as an order keeper. These fees compensate keepers for gas costs and are part of the documented protocol design.
-
-On Arbitrum, GMX uses WETH/aeWETH and a Vault contract to manage collateral. The WETH/aeWETH token and Vault contracts are verified. The aeWETH implementation mints and burns tokens 1:1 with ETH backing, and the Vault handles deposits and withdrawals according to GMX’s leverage and collateral logic. There is no non-standard minting, burning, or accounting logic relevant to the observed transactions.
+- GMX on Arbitrum uses an off-chain keeper model: users submit orders via the Router and PositionManager, which store `IncreaseOrder` structs in `OrderBook` including an `executionFee` in ETH. Later, keepers execute these orders and receive the `executionFee` as compensation.
+- The `aeWETH` contract at `0x8b194beae1d3e0788a1a35173978001acdfba668` wraps native ETH as ERC20 `0x82af49447d8a07e3bd95bd0d56f35241523fbab1` and is used as `purchaseToken` and `collateralToken` for WETH-denominated GMX positions. Balance diffs for the incident transactions show only this token moving between OrderBook and Vault when the order is created and executed.
+- GMX Router `0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355` maintains a plugin list and forwards user and keeper calls to OrderBook, Vault, and PositionManager. Disassembly of the Router bytecode shows `CALLER`-based checks for plugin authentication and no `ORIGIN` opcode, so Router cannot distinguish whether `OrderBook.executeIncreaseOrder` is reached via PositionManager or via a direct plugin call from an EOA.
+- PositionManager `0x75e42e6f01baf1d6022bea862a28774a9f8a4a0c` enforces an `onlyOrderKeeper` modifier on `executeIncreaseOrder`, restricting which addresses may call it. However, once `OrderBook.executeIncreaseOrder` is entered, the logic does not re-check `msg.sender` and always pays the `executionFee` to the provided `_feeReceiver` address after price and Vault checks pass.
 
 ## Vulnerability Analysis
 
-The reviewed transactions implement standard GMX order funding and keeper execution behavior. A user funds a GMX increase order via a router, which converts part of the sent ETH into WETH and credits the OrderBook as collateral, while retaining a configured amount of ETH on the router as part of the order funding path. Later, an allowlisted GMX keeper executes the increase order via PositionManager, transferring WETH collateral from the OrderBook to the Vault and receiving the configured execution fee.
+The ACT opportunity arises from a combination of contract interfaces and fee-handling design:
 
-Verified contract source, traces, and balance diffs confirm:
-- No access control failure: `PositionManager::executeIncreaseOrder` is restricted by `onlyOrderKeeper`, and the caller in the seed keeper transaction is consistent with a GMX keeper address.
-- No oracle manipulation: price queries in the trace go through GMX’s standard oracle aggregation (Chainlink and FastPriceFeed) and are used to validate the order.
-- No unsafe accounting: WETH/aeWETH deposits and transfers are 1:1 with ETH backing; collateral moves exactly as expected between OrderBook and Vault.
-- No reentrancy or delegatecall abuse: calls stay within verified GMX contracts and the router; the router does not perform delegatecall into untrusted addresses in the observed flows.
+- `OrderBook` exposes `executeIncreaseOrder` as an external nonReentrant entrypoint, with no access-control modifier beyond `nonReentrant`. The function reads a stored `IncreaseOrder`, validates price, forwards the `purchaseToken` to Vault, calls `IRouter(router).pluginIncreasePosition`, and then unconditionally pays `order.executionFee` to `_feeReceiver`.
+- Router authenticates plugins using `CALLER`-based checks and contains no `ORIGIN` opcode. This means Router cannot distinguish whether it is called by PositionManager or directly by a keeper EOA acting through a plugin entrypoint; the chain of calls into `OrderBook.executeIncreaseOrder` remains valid as long as plugin checks on `CALLER` pass.
+- PositionManager wraps `executeIncreaseOrder` with `onlyOrderKeeper` to restrict who can route executions via this contract, but the economic outcome is that whichever keeper executes the order first chooses the `feeReceiver` and captures the entire user-funded `executionFee`.
+- Execution fees are not bound to a specific executor or to protocol-controlled distribution logic. Instead, they become a deterministic profit opportunity for any keeper or searcher able to reach `executeIncreaseOrder` for a stored order and satisfy the price and Vault checks.
 
-Because there is no bug, misconfiguration, or economic vulnerability that allows an unprivileged adversary to extract profit or cause non-monetary harm, there is no ACT root cause and no vulnerability to remediate.
+The core vulnerable components are:
+
+- `GMX OrderBook` at `0x09f77e8a13de9a35a7231028187e9fd5db8a2acb` (Arbitrum): `executeIncreaseOrder` is external nonReentrant and unconditionally pays `executionFee` to a caller-specified `_feeReceiver`.
+- `GMX Router` at `0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355` (Arbitrum): routes execution via plugin functions authenticated solely by `CALLER`, forwarding to `OrderBook.executeIncreaseOrder`.
+- `GMX PositionManager` at `0x75e42e6f01baf1d6022bea862a28774a9f8a4a0c` (Arbitrum): wraps `executeIncreaseOrder` with `onlyOrderKeeper`, forwarding keeper calls into `OrderBook` with a chosen `feeReceiver`.
+
+The design violates the following security principles:
+
+- Execution fee accounting is not tightly bound to the economic role of a specific keeper; any authorised keeper or searcher that satisfies the price checks can collect user-funded fees as profit, without constraints on how or by whom execution occurs.
+- Exposed execution entrypoints (`executeIncreaseOrder`) allow generalised MEV strategies: they provide a direct one-transaction path from observing a stored order to receiving the fee as ETH in the same transaction.
+- The protocol does not enforce that execution fees compensate a uniquely selected executor; instead, they are available to any address in the keeper set that reaches the execution first, turning user-funded fees into a deterministic competition prize.
 
 ## Detailed Root Cause Analysis
 
-### Seed Transaction 1: User Order Funding (0x0b8c…4712)
+### Pre-state σ_B and stored order
 
-On Arbitrum (chainid 42161), EOA `0xdf3340a436c27655ba62f8281565c9925c3a5221` sends `0.2003` ETH to router contract `0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355` with selector `0x601894bb`. The transaction metadata and balance diffs are in:
-- `artifacts/root_cause/seed/42161/0x0b8cd648fb585bc3d421fc02150013eab79e211ef8d1c68100f2820ce90a4712/metadata.json`
-- `artifacts/root_cause/seed/42161/0x0b8cd648fb585bc3d421fc02150013eab79e211ef8d1c68100f2820ce90a4712/balance_diff.json`
+The relevant pre-state σ_B is Arbitrum block `355878385` immediately after user funding transaction:
 
-The trace shows the router calling GMX contracts and the WETH/aeWETH proxy:
+- Chain: Arbitrum One (`chainid = 42161`)
+- Tx: `0x0b8cd648fb585bc3d421fc02150013eab79e211ef8d1c68100f2820ce90a4712`
 
-```text
-Seed transaction trace (cast run -vvvvv) for tx 0x0b8c…4712
-  [452331] 0x7D3BD50336f64b7A473C51f54e7f0Bd6771cc355::601894bb{value: 200300000000000000}(...)
-    ├─ [22599] 0xaBBc5F99639c9B6bCb58544ddf04EFA6802F4064::approvePlugin(0x09f77E8A13De9a35a7231028187e9fD5DB8a2ACB)
-    ├─ [86098] 0x489ee077994B6658eAfA855C308275EAd8097C4A::getMinPrice(TransparentUpgradeableProxy: [0x82aF49447D8a07e3bd95BD0d56f35241523fBab1]) [staticcall]
-    ├─ [313108] 0x09f77E8A13De9a35a7231028187e9fD5DB8a2ACB::createIncreaseOrder{value: 100300000000000000}([...])
-    │   ├─ [19811] TransparentUpgradeableProxy::fallback{value: 100300000000000000}()
-    │   │   ├─ [12574] aeWETH::deposit{value: 100300000000000000}() [delegatecall]
-    │   │   │   ├─ emit Transfer(from: 0x0000000000000000000000000000000000000000, to: 0x09f77E8A13De9a35a7231028187e9fD5DB8a2ACB, value: 100300000000000000)
-    │   │   └─ ← [Stop]
-    │   └─ storage updates for the new order
-    └─ ← [Stop]
+From `metadata.json`, `trace.cast.log`, `balance_diff.json`, and `receipt.json` for this tx, plus `OrderBook.sol` and `aeWETH.sol`, the analyzer reconstructs:
+
+- EOA `0xdf3340a436c27655ba62f8281565c9925c3a5221` sends `0.200300000000000000` ETH to Router `0x7d3b...`.
+- Router calls into GMX components (Vault, price feeds) and then calls `OrderBook.createIncreaseOrder{value: 0.100300000000000000}` with a WETH-only path.
+- Inside the WETH proxy `0x82af49447d8a07e3bd95bd0d56f35241523fbab1`, `aeWETH.deposit` mints `0.100300000000000000` `aeWETH` to OrderBook.
+- `balance_diff.json` shows:
+  - OrderBook’s `aeWETH` balance increase by `0.100300000000000000` token.
+  - Router retaining `0.100000000000000000` ETH.
+  - The user’s native balance decreasing by ~`0.200317915049540000` ETH including gas.
+- The `CreateIncreaseOrder` log in the receipt records `executionFee = 0.000300000000000000` ETH (`300000000000000` wei) for this order.
+
+σ_B therefore includes:
+
+- `OrderBook` stores an `IncreaseOrder` for account `0x7d3b...` with `executionFee = 300000000000000` wei and `purchaseToken = aeWETH`.
+- `isOrderKeeper[0xd4266f8f82f7405429ee18559e548979d49160f3] = true` in `PositionManager`.
+
+### Permissionless execution entrypoint and fee payout
+
+The key function in `OrderBook.sol` is:
+
+```solidity
+function executeIncreaseOrder(address _address, uint256 _orderIndex, address payable _feeReceiver) external nonReentrant {
+    IncreaseOrder memory order = increaseOrders[_address][_orderIndex];
+    require(order.account != address(0), "OrderBook: non-existent order");
+
+    // increase long should use max price
+    // increase short should use min price
+    (uint256 currentPrice, ) = validatePositionOrderPrice(
+        order.triggerAboveThreshold,
+        order.triggerPrice,
+        order.indexToken,
+        order.isLong,
+        true
+    );
+
+    delete increaseOrders[_address][_orderIndex];
+
+    IERC20(order.purchaseToken).safeTransfer(vault, order.purchaseTokenAmount);
+
+    if (order.purchaseToken != order.collateralToken) {
+        address[] memory path = new address[](2);
+        path[0] = order.purchaseToken;
+        path[1] = order.collateralToken;
+
+        uint256 amountOut = _swap(path, 0, address(this));
+        IERC20(order.collateralToken).safeTransfer(vault, amountOut);
+    }
+
+    IRouter(router).pluginIncreasePosition(order.account, order.collateralToken, order.indexToken, order.sizeDelta, order.isLong);
+
+    // pay executor
+    _transferOutETH(order.executionFee, _feeReceiver);
+
+    emit ExecuteIncreaseOrder(
+        order.account,
+        _orderIndex,
+        order.purchaseToken,
+        order.purchaseTokenAmount,
+        order.collateralToken,
+        order.indexToken,
+        order.sizeDelta,
+        order.isLong,
+        order.triggerPrice,
+        order.triggerAboveThreshold,
+        order.executionFee,
+        currentPrice
+    );
+}
 ```
 
-The associated balance diffs show:
-- The WETH/aeWETH contract at `0x82af49447d8a07e3bd95bd0d56f35241523fbab1` increases its ETH backing by `0.1003` ETH.
-- The router `0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355` ends with `0.1` ETH more than before.
-- The user EOA loses approximately `0.20031791504954` ETH, accounting for the funded order amount and gas.
+Properties:
 
-This behavior matches a GMX router that:
-- Receives the user’s ETH.
-- Forwards `0.1003` ETH via the WETH/aeWETH proxy to mint WETH to the OrderBook as collateral.
-- Retains `0.1` ETH on the router in preparation for keeper execution and fees.
+- The function is `external nonReentrant` with no access-control modifier. It does not check `msg.sender` or restrict callers beyond reentrancy protection.
+- It deletes the stored `IncreaseOrder`, moves `purchaseToken` from OrderBook to Vault, triggers `pluginIncreasePosition` on Router, and then unconditionally calls `_transferOutETH(order.executionFee, _feeReceiver)`.
+- The `_feeReceiver` is fully controlled by the caller of `executeIncreaseOrder`.
 
-The router’s pseudo-decompilation summarizes this behavior:
+Disassembly of Router `0x7d3b...` shows that it uses `CALLER`-based checks for plugin authentication and includes no `ORIGIN` opcodes. This confirms that Router cannot distinguish whether `executeIncreaseOrder` is reached via PositionManager or a direct plugin path; as long as the plugin check on `CALLER` passes, the call sequence to OrderBook is valid.
 
-```text
-Pseudo-decompilation summary for router 0x7d3b…c355
-1) User fund handling
-- The router is the direct recipient of user ETH in tx 0x0b8c…4712, receiving 0.2003 ETH from the user EOA.
-- It forwards 0.1003 ETH (via the WETH/aeWETH proxy) into the GMX OrderBook by calling deposit() and crediting WETH collateral.
-- The remaining 0.1 ETH is retained in the router’s own balance as part of the GMX order funding path.
+### Keeper execution and realised profit
+
+The adversary profit transaction is:
+
+- Chain: Arbitrum One (`chainid = 42161`)
+- Tx: `0x28a000501ef8e3364b0e7f573256b04b87d9a8e8173410c869004b987bf0beef`
+- Sender (keeper EOA): `0xd4266f8f82f7405429ee18559e548979d49160f3`
+
+From `metadata.json`, `debug_trace_callTracer.json`, `receipt.json`, and `balance_diff.json`:
+
+- The keeper sends a 0-value transaction to PositionManager `0x75e4...` with selector `0xd38ab519` (`executeIncreaseOrder`) and parameters `(account=0x7d3b..., orderIndex=0, feeReceiver=0xd4266f...)`.
+- The call tracer shows the sequence:
+  - `EOA 0xd4266f...` → `PositionManager.executeIncreaseOrder`
+  - `PositionManager` (gated by `onlyOrderKeeper`) reads the order from `OrderBook.getIncreaseOrder`, performs Vault and price checks.
+  - `PositionManager` calls `OrderBook.executeIncreaseOrder(account=0x7d3b..., orderIndex=0, feeReceiver=0xd4266f...)`.
+  - Inside `OrderBook.executeIncreaseOrder`, `purchaseToken` is moved to Vault, `pluginIncreasePosition` is called on Router, and `_transferOutETH(order.executionFee, _feeReceiver)` sends the execution fee to `0xd4266f...`.
+- The `balance_diff.json` for tx `0x28a0...beef` records:
+
+```json
+{
+  "native_balance_deltas": [
+    {
+      "address": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "before_wei": "190705247770672407830199",
+      "after_wei": "190705247470672407830199",
+      "delta_wei": "-300000000000000"
+    },
+    {
+      "address": "0xd4266f8f82f7405429ee18559e548979d49160f3",
+      "before_wei": "21021084863633651560",
+      "after_wei": "21021363955169633560",
+      "delta_wei": "279091535982000"
+    }
+  ]
+}
 ```
 
-There is no abnormal control flow, no reentrancy, and no unexplained external sends beyond the GMX contracts involved.
+- The WETH/aeWETH wrapper `0x82af...` decreases by `300000000000000` wei of native ETH.
+- The keeper EOA `0xd4266f...` increases by `279091535982000` wei.
+- `erc20_balance_deltas` show `-0.100300000000000000` `aeWETH` from OrderBook and `+0.100000000000000000` `aeWETH` to Vault, matching the position increase.
+- `receipt.json` shows:
+  - `gasUsed = 662961`
+  - `effectiveGasPrice = 31538000` wei
+  - Gas fees = `662961 * 31538000 = 20908464018000` wei.
 
-### Seed Transaction 2: Keeper Order Execution (0x28a0…beef)
+The net ETH profit is therefore:
 
-In the second seed transaction, EOA `0xd4266f8f82f7405429ee18559e548979d49160f3` calls GMX PositionManager `0x75e42e6f01baf1d6022bea862a28774a9f8a4a0c` with selector `0xd38ab519` (`executeIncreaseOrder`), passing:
-- `user` (the account whose order is executed): `0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355` (the router)
-- `orderIndex`: `0`
-- `feeReceiver`: `0xd4266f8f82f7405429ee18559e548979d49160f3` (the caller)
+- `300000000000000` wei (execution fee) − `20908464018000` wei (gas) = `279091535982000` wei.
 
-The transaction metadata and balance diffs are in:
-- `artifacts/root_cause/seed/42161/0x28a000501ef8e3364b0e7f573256b04b87d9a8e8173410c869004b987bf0beef/metadata.json`
-- `artifacts/root_cause/seed/42161/0x28a000501ef8e3364b0e7f573256b04b87d9a8e8173410c869004b987bf0beef/balance_diff.json`
+This matches the native balance delta for the keeper and confirms that executing this stored order from σ_B yields a fixed ETH profit to the executor who sets itself as `feeReceiver`.
 
-These show:
-- The WETH contract’s ETH backing decreases by `0.0003` ETH.
-- The keeper EOA gains approximately `0.000279091535982` ETH (after paying gas).
-- The OrderBook’s WETH balance decreases by `0.1003` WETH.
-- The Vault’s WETH balance increases by `0.1` WETH.
+### Deterministic ACT opportunity
 
-This matches a GMX increase order execution where:
-- The configured `executionFee` is `0.0003` ETH.
-- The keeper receives this execution fee.
-- WETH collateral of `0.1003` is partially moved from OrderBook to Vault to realize the position.
+Given σ_B:
 
-The `PositionManager::executeIncreaseOrder` function is restricted using `onlyOrderKeeper`. The collected GMX source for PositionManager confirms that only addresses in `isOrderKeeper` can call this function. The address history for `0xd4266f8f82f7405429ee18559e548979d49160f3` shows repeated calls to GMX PositionManager functions with zero transaction value and small execution fees, consistent with a GMX keeper rather than a one-off adversary.
+- OrderBook holds an `IncreaseOrder` with `executionFee = 300000000000000` wei for account `0x7d3b...` and orderIndex 0.
+- Price and Vault conditions are satisfied (as evidenced by the successful keeper execution).
+- `isOrderKeeper[0xd4266f...] = true` in PositionManager; more generally, any EOA in `isOrderKeeper` can call `PositionManager.executeIncreaseOrder`.
 
-### Code-Level Behavior
+Any EOA `X` in the `isOrderKeeper` set that submits a transaction `PositionManager.executeIncreaseOrder(account=0x7d3b..., orderIndex=0, feeReceiver=X)` while the order remains valid will:
 
-The aeWETH token and GMX contracts provide further evidence:
-- The aeWETH implementation’s deposit function mints WETH tokens 1:1 with the ETH sent, updating balances and backing without custom hooks or bridge-specific logic that would affect these transactions.
-- GMX OrderBook and PositionManager code handle order creation and execution with explicit bounds, oracle checks, and collateral accounting.
+- Enter `OrderBook.executeIncreaseOrder` with `_feeReceiver = X`.
+- Cause `_transferOutETH(order.executionFee, X)` to send `300000000000000` wei of ETH to `X`.
+- Pay the same gas cost as the observed keeper (up to minor variance from state-dependent gas), resulting in a net ETH profit close to `279091535982000` wei.
 
-Together, the on-chain traces, balance diffs, and code confirm that:
-- The router correctly forwards collateral and retains ETH as part of the standard GMX funding pattern.
-- The keeper executes the order according to GMX rules, receiving only the configured execution fee.
-- No unauthorized state changes or anomalous value flows occur.
+This is a single-transaction ACT opportunity using only:
 
-### Root Cause Conclusion
-
-There is no ACT root cause. The seed transactions implement:
-- Standard GMX user behavior: funding an increase order via a router, which partially converts ETH to WETH collateral and retains some ETH for fees.
-- Standard GMX keeper behavior: an allowlisted keeper executing the order via `executeIncreaseOrder`, transferring collateral between OrderBook and Vault and receiving the configured execution fee.
-
-No unprivileged adversary transaction sequence b exists that yields profit or non-monetary harm relative to any pre-state sigma_B. Protocol invariants remain satisfied, and there is no vulnerability to remediate.
+- Publicly observable on-chain data (the stored order and `executionFee`).
+- Public contract interfaces and bytecode (OrderBook, PositionManager, Vault, Router).
+- Standard transaction submission from an EOA in the keeper set.
 
 ## Adversary Flow Analysis
 
-No adversary is present in this scenario. The participants are:
-- A normal GMX user EOA (`0xdf3340a436c27655ba62f8281565c9925c3a5221`) funding an increase order through the router.
-- The GMX router contract (`0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355`) acting as a front-end/aggregator for GMX OrderBook.
-- The GMX OrderBook (`0x09f77E8A13De9a35a7231028187e9fD5DB8a2ACB`), PositionManager (`0x75e42e6f01baf1d6022bea862a28774a9f8a4a0c`), and Vault (`0x489ee077994B6658eAfA855C308275EAd8097C4A`) contracts.
-- An allowlisted GMX keeper EOA (`0xd4266f8f82f7405429ee18559e548979d49160f3`) repeatedly calling `executeIncreaseOrder` and related functions to process user orders.
+### Adversary strategy
 
-Address histories for the keeper EOA indicate repeated, small-fee interactions with GMX’s PositionManager, typical of a service account executing many orders. There is no pattern of exploiting a bug or extracting aberrant profit. The router’s behavior is deterministic and limited to the documented GMX plugin interactions.
+The adversary strategy is a one-shot MEV-style keeper execution:
 
-Because there is no adversary, there is no adversary lifecycle (reconnaissance, exploitation, cash-out) and no adversary cluster to identify. The accounts involved perform their expected roles under GMX’s design.
+- Observe a user-funded GMX increase order with a positive `executionFee` stored in OrderBook.
+- Construct a transaction calling `PositionManager.executeIncreaseOrder` with `feeReceiver` set to the adversary-controlled EOA.
+- Submit this transaction with competitive gas so it executes the order while price conditions hold, capturing the `executionFee` as ETH profit after gas.
+
+### Adversary-related accounts and stakeholders
+
+- Adversary EOA:
+  - Chain: Arbitrum One
+  - Address: `0xd4266f8f82f7405429ee18559e548979d49160f3`
+  - Role: Sender of keeper tx `0x28a0...beef`, executor of the stored increase order, and direct recipient of the `300000000000000` wei execution fee, realising a net ETH balance increase of `279091535982000` wei.
+- User EOA:
+  - Chain: Arbitrum One
+  - Address: `0xdf3340a436c27655ba62f8281565c9925c3a5221`
+  - Role: Funds and creates the GMX increase order with the execution fee in tx `0x0b8c...4712`.
+- Key contracts:
+  - OrderBook: `0x09f77e8a13de9a35a7231028187e9fd5db8a2acb` (verified GMX OrderBook).
+  - Router: `0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355` (GMX Router, unverified source but disassembled).
+  - PositionManager: `0x75e42e6f01baf1d6022bea862a28774a9f8a4a0c` (verified GMX PositionManager/BasePositionManager).
+  - Vault: `0x489ee077994b6658eafa855c308275ead8097c4a` (GMX Vault).
+  - aeWETH implementation: `0x8b194beae1d3e0788a1a35173978001acdfba668` (wraps `0x82af...`).
+
+### Transaction-level lifecycle
+
+1. **User order funding and storage**
+   - Chain: Arbitrum One
+   - Tx: `0x0b8cd648fb585bc3d421fc02150013eab79e211ef8d1c68100f2820ce90a4712`
+   - Block: `355878385`
+   - Role: `victim-observed`
+   - Effect:
+     - User EOA `0xdf3340...5221` sends `0.200300000000000000` ETH to Router `0x7d3b...`.
+     - Router routes to `OrderBook.createIncreaseOrder` and `aeWETH.deposit`, minting `0.100300000000000000` aeWETH to OrderBook and retaining `0.100000000000000000` ETH.
+     - An `IncreaseOrder` is stored with `executionFee = 300000000000000` wei.
+
+2. **Keeper execution and fee collection**
+   - Chain: Arbitrum One
+   - Tx: `0x28a000501ef8e3364b0e7f573256b04b87d9a8e8173410c869004b987bf0beef`
+   - Block: `355878605`
+   - Role: `adversary-crafted`
+   - Effect:
+     - Keeper EOA `0xd4266f...60f3` calls `PositionManager.executeIncreaseOrder` with `account=0x7d3b...`, `orderIndex=0`, `feeReceiver=0xd4266f...`.
+     - PositionManager forwards execution to `OrderBook.executeIncreaseOrder`.
+     - OrderBook moves `0.100300000000000000` aeWETH from OrderBook to Vault and pays `300000000000000` wei of ETH as `executionFee` to `0xd4266f...`.
+     - Gas fees equal `20908464018000` wei; the keeper’s net ETH profit is `279091535982000` wei, as confirmed by native balance deltas.
+
+The `normal_transactions_355878384_355878672.json` for `0xd4266f...` over the incident window shows no conflicting activity; this keeper transaction is the unique profit realisation event for the address in that block range.
 
 ## Impact & Losses
 
-There is no protocol loss, user loss, or non-monetary harm resulting from these transactions. The observed value transfers are:
-- User funds used to create and collateralize a GMX increase order.
-- A configured GMX execution fee (`0.0003` ETH) paid from protocol flow to the allowlisted keeper when the order is executed.
+- Total user-paid execution fee:
+  - Token: ETH
+  - Amount: `0.000300000000000000` ETH paid by the user order in tx `0x0b8c...4712`.
+- Profit captured by keeper:
+  - Net ETH profit: `0.000279091535982000` ETH to EOA `0xd4266f8f82f7405429ee18559e548979d49160f3` in tx `0x28a0...beef`.
 
-These transfers are expected behavior and part of the GMX incentive model. No additional value is diverted to any account beyond these documented flows, and all collateral and accounting updates align with GMX’s design.
+There is no protocol insolvency or asset theft: the user explicitly funded an execution fee, and the protocol design allocates this fee entirely to the executor. However, this configuration means:
+
+- Execution fees on GMX Arbitrum form a deterministic MEV-style revenue stream for authorised keepers.
+- Once a user order with a positive `executionFee` is stored and price conditions are met, whichever keeper executes `executeIncreaseOrder` first captures the entire fee as ETH.
+- Execution fairness and fee distribution depend on off-chain competition among keepers rather than on-chain constraints, concentrating value in the fastest actors within the keeper set.
 
 ## References
 
-- [1] Root cause analyzer current_analysis_result for iteration 3: `artifacts/root_cause/root_cause_analyzer/iter_3/current_analysis_result.json`
-- [2] GMX OrderBook, PositionManager, and Vault verified source (Arbitrum): `artifacts/root_cause/data_collector/iter_1/contract/42161`
-- [3] Router decompilation and traces for `0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355`: `artifacts/root_cause/data_collector/iter_2/contract/42161/0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355`
-- [4] Seed transaction metadata, traces, and balance diffs: `artifacts/root_cause/seed/42161`
+- Seed tx `0x0b8c...4712` metadata, trace, and balance diff:
+  - `artifacts/root_cause/seed/42161/0x0b8cd648fb585bc3d421fc02150013eab79e211ef8d1c68100f2820ce90a4712/`
+- Seed tx `0x28a0...beef` metadata and balance diff:
+  - `artifacts/root_cause/seed/42161/0x28a000501ef8e3364b0e7f573256b04b87d9a8e8173410c869004b987bf0beef/`
+- GMX OrderBook.sol source (`executeIncreaseOrder` implementation):
+  - `artifacts/root_cause/data_collector/iter_1/contract/42161/0x09f77e8a13de9a35a7231028187e9fd5db8a2acb/source/src/core/OrderBook.sol`
+- GMX PositionManager and BasePositionManager source:
+  - `artifacts/root_cause/data_collector/iter_1/contract/42161/0x75e42e6f01baf1d6022bea862a28774a9f8a4a0c/source/`
+- GMX Vault contract source:
+  - `artifacts/root_cause/data_collector/iter_1/contract/42161/0x489ee077994b6658eafa855c308275ead8097c4a/source/src/Contract.sol`
+- GMX Router bytecode and disassembly:
+  - `artifacts/root_cause/data_collector/iter_2/contract/42161/0x7d3bd50336f64b7a473c51f54e7f0bd6771cc355/disassemble/disassembly.txt`
 
