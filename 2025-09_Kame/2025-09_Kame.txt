@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-09_Kame]
+- txhashes (tx, chainid):
+  - 0x6150ec6b2b1b46d1bcba0cab9c3a77b5bca218fd1cdaad1ddc7a916e4ce792ec, 1329
+

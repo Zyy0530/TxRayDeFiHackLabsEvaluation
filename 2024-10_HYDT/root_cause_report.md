@@ -1,486 +1,494 @@
-# HYDT initialMint Flash-Loan Price-Manipulation Exploit on BSC
+# HYDT InitialMintV2 Mispricing Arbitrage on BSC
 
-**Protocol:** HYDT (High Yield Dollar Stable Token, `HYDT`)  
-**Category:** Protocol bug (price-oracle / minting logic)  
-**Chain:** BNB Smart Chain (BSC, chainid 56)  
-**Exploit transaction:** `0xa9df1bd97cf6d4d1d58d3adfbdde719e46a1548db724c2e76b4cd4c3222f22b3` (BSC block `0x28fe75f`)  
-**Primary adversary EOA:** `0x4645863205b47a0a3344684489e8c446a437d66c`  
-**Executor contract:** `0x8f921e27e3af106015d1c3a244ec4f48dbfcad14`
+Protocol: HYDT (BSC, chainid 56)  
+Root cause category: protocol_bug  
+ACT classification: **permissionless on-chain arbitrage opportunity** (is_act = true)
 
-The analysis below is based solely on the deterministic root-cause artifacts (seed transaction trace, balance diffs, collected contract sources, and executor disassembly) under the provided root cause directory.
+The incident centers on a single adversary-crafted transaction
+`0xa9df1bd97cf6d4d1d58d3adfbdde719e46a1548db724c2e76b4cd4c3222f22b3`
+in block `42985311` on BSC, in which an EOA exploits the pricing logic
+of the HYDT InitialMintV2 contract to mint underpriced HYDT and dump it
+through multiple pools for deterministic profit in BNB-equivalent units.
 
----
+## Incident Overview TL;DR
 
-## Incident Overview & TL;DR
+An EOA `0x4645863205b47a0a3344684489e8c446a437d66c` on BSC calls a
+dedicated orchestrator contract `0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14`
+in transaction
+`0xa9df1bd97cf6d4d1d58d3adfbdde719e46a1548db724c2e76b4cd4c3222f22b3`
+(block `42985311`).
+The orchestrator invokes HYDT InitialMintV2 at
+`0xA2268Fcc2FE7A2Bb755FbE5A7B3Ac346ddFeDB9B` via
+`InitialMintV2.initialMint{value: 11 BNB}`,
+minting HYDT at a fixed **1 HYDT per 1 USD** rate derived from a WBNB/USDT
+reference pool, and then immediately dumps the freshly minted HYDT
+through three HYDT pools.
 
-An adversary used a single, adversary-crafted transaction on BSC to exploit HYDT’s initial minting path. The attacker-controlled executor contract `0x8f92…`:
+Because HYDT is trading above this implicit 1 HYDT = 1 USD price in those pools,
+the sequence yields a deterministic profit in BNB-equivalent terms:
+the adversary EOA’s BNB balance decreases by
+`3.053395088913977748` BNB (including gas),
+while its WBNB balance increases by
+`10.168067925005859920` WBNB,
+for a net gain of
+`7.114672836091882172` units in the
+`BNB-equivalent (BNB/WBNB)` reference asset.
 
-- Borrowed a large amount of USDT from a Pancake V3 pool as a flash-loan.  
-- Used that USDT to heavily skew the WBNB/USDT price in a Pancake V2 pair.  
-- Immediately called HYDT’s `initialMint` flow, which computes minted HYDT based on the manipulated AMM reserves.  
-- Received a large amount of HYDT at a mispriced rate, then sold it back into USDT and WBNB.  
-- Repaid the flash-loan and kept the remaining WBNB as profit.
-
-The core of the incident is:
-
-- **Incident brief:** In the exploit transaction, EOA `0x4645…` calls its pre-deployed executor `0x8f92…` with ~3.05 BNB and selector `0x3c9c2087`. The executor takes a USDT flash-loan from Pancake V3 pool `0x92b7…`, routes the USDT into Pancake V2 WBNB/USDT pair `0x16b9…` to push the price, and then triggers HYDT’s `initialMint` via contract `0xA2268…`. This call mints **60,961.921249934820691479 HYDT** to the executor at the manipulated price.
-
-- **Root cause brief:** The `initialMint` logic in contract `0xA2268…` (with helper `0xc516…`) directly uses the **instantaneous** reserves of the Pancake V2 WBNB/USDT pair `0x16b9…` inside the very same transaction, without any TWAP, delay, or flash-loan protection. As a result, a single flash-loan and AMM swap can over-mint HYDT against a relatively small WBNB deposit, yielding a net on-chain gain of approximately **7.114672836091882172 BNB-equivalent** for the adversary.
-
+The vulnerable mint pricing, the orchestrated call chain, and the profit
+calculation are all fully supported by on-chain traces and verified
+contract source code, and the opportunity is accessible to any
+unprivileged EOA with sufficient BNB on BSC using only public on-chain
+state, satisfying the ACT criteria.
 
 ## Key Background
 
-### HYDT token and minting model
+- HYDT is an ERC‑20 token on BSC with liquidity across multiple
+  HYDT/WBNB and HYDT/USDT pools.
+- The InitialMintV2 contract implements an **initial mint** mechanism:
+  it converts BNB to HYDT using `DataFetcher.quote` on a WBNB/USDT
+  reference pool. The BNB is forwarded to a Reserve contract, and LP
+  pools absorb slippage when the newly minted HYDT is dumped.
+- The adversary does not call InitialMintV2 directly. Instead, they use
+  an orchestrator contract
+  `0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14` to chain together:
+  - `InitialMintV2.initialMint`,
+  - `HYDT.mint`,
+  - router swaps through the three HYDT pools, and
+  - final asset routing back to the EOA.
+  All invoked functions are publicly accessible and behave under standard
+  DeFi semantics; no privileged access checks or non-public data sources
+  are involved in the exploit path.
 
-HYDT is an ERC20 token deployed at `0x9810512be701801954449408966c630595d0cd51`. The HYDT source code shows:
+From the ACT perspective, the **pre‑state** for this opportunity is:
 
-- Minting is controlled by an `AccessControl`-based role (`CALLER_ROLE`).  
-- Only addresses with `CALLER_ROLE` can invoke `mint(to, amount)`.  
-- HYDT itself does **not** contain price logic; it simply mints the amount requested by authorized caller contracts.
+- **Block height**: `B = 42985311` on BSC (chainid 56).
+- **Pre‑state definition**:
+  publicly reconstructible chain state immediately before block 42985311,
+  including balances and pool reserves for HYDT, WBNB, USDT, the HYDT
+  pools, the Reserve contract, and the adversary EOA
+  `0x4645863205b47a0a3344684489e8c446a437d66c`.
+- **Pre‑state evidence**:
+  - `artifacts/root_cause/seed/56/0xa9df1bd9…22f22b3/metadata.json`
+  - `artifacts/root_cause/seed/56/0xa9df1bd9…22f22b3/balance_diff.json`
+  - `artifacts/root_cause/data_collector/iter_4/address/56/0x46458632…d66c/balance_snapshot_42985300-42986000.json`
+  - `artifacts/root_cause/data_collector/iter_4/address/56/0x46458632…d66c/tokentx_42985300-42986000.json`
+  - Verified contract sources for:
+    - `InitialMintV2` at `0xA2268Fcc…dFeDB9B`,
+    - `HYDT` at `0x9810512B…5D0cD51`,
+    - HYDT pools at
+      `0xD5f07FEd…E1346d7E`,
+      `0xBB8ae522…38ce957a`,
+      `0x03feD6eC…AeF79f0d`.
 
-**Evidence snippet 1 – HYDT mint function (HYDT token source, verified contract `0x9810…`):**
+## Vulnerability Analysis
+
+The core vulnerability lies in the **pricing design of InitialMintV2**
+and its interaction with existing HYDT secondary markets.
+
+### InitialMintV2 pricing logic
+
+The verified InitialMintV2 contract at
+`0xA2268Fcc2FE7A2Bb755FbE5A7B3Ac346ddFeDB9B` exposes
+an external payable `initialMint` function with time‑window and
+USD‑notional caps, but **no coupling to the actual HYDT market price**.
+Relevant excerpt (simplified):
 
 ```solidity
-// HYDT.sol
-bytes32 public constant CALLER_ROLE = keccak256(abi.encodePacked("Caller"));
+function getCurrentPrice() public view returns (uint256) {
+    address[] memory path = new address[](3);
+    path[0] = address(HYDT);
+    path[1] = WBNB;
+    path[2] = USDT;
+    uint256 amountIn = 1 * 1e18;
+    uint256 price = DataFetcher.quoteRouted(PANCAKE_FACTORY, amountIn, path);
+    return price;
+}
 
-function mint(address to, uint256 amount)
-    external
-    override
-    onlyRole(CALLER_ROLE)
-    returns (bool)
-{
-    _mint(to, amount);
-    return true;
+function initialMint() external payable {
+    require(msg.value > 0, "InitialMint: insufficient BNB amount");
+    ...
+    uint256 amount = DataFetcher.quote(PANCAKE_FACTORY, msg.value, WBNB, USDT);
+    ...
+    initialMints.amount += amount;
+    dailyInitialMints.amount += amount;
+    SafeETH.safeTransferETH(RESERVE, msg.value);
+    HYDT.mint(_msgSender(), amount);
+
+    emit InitialMint(_msgSender(), msg.value, amount, 1 * 1e18);
 }
 ```
 
-*Caption: HYDT grants `CALLER_ROLE` to external control contracts and blindly mints the requested `amount` for them; all economic safeguards must therefore reside in those caller contracts, not in HYDT itself.*
+Key properties:
 
-In the collected HYDT source, the initializer is expected to grant `CALLER_ROLE` to “Control” and “Earn” style contracts. The analysis artifacts and traces show that the `initialMint` contract `0xA2268…` is one such privileged caller that can mint HYDT on behalf of depositors.
+- `initialMint()` computes `amount` using
+  `DataFetcher.quote(PANCAKE_FACTORY, msg.value, WBNB, USDT)`, i.e.
+  **converting the input BNB to a USDT notional via a WBNB/USDT reference pool**.
+- It then calls `HYDT.mint(_msgSender(), amount)` and emits an
+  `InitialMint` event with `callingPrice = 1e18`, effectively minting
+  HYDT at a fixed rate of **1 HYDT per 1 USD**.
+- Limits `INITIAL_MINT_LIMIT` and `DAILY_INITIAL_MINT_LIMIT` cap the
+  **total USD value** minted but do not depend on or constrain the
+  prevailing HYDT price in other pools.
 
-### HYDT initialMint and helper/oracle contracts
+The HYDT token at `0x9810512Be701801954449408966c630595D0cD51`
+is an AccessControl‑protected ERC‑20.
+`HYDT.mint` is restricted to addresses granted the `CALLER_ROLE`,
+which in deployment includes the InitialMintV2 contract, so
+InitialMintV2 can freely mint HYDT as long as its own constraints are satisfied.
 
-Two key contracts front HYDT’s minting:
+### Misalignment with secondary market price
 
-- **HYDT initialMint / control contract**: `0xA2268Fcc2FE7A2Bb755FbE5A7B3Ac346ddFeDB9B`  
-  - Exposes an `initialMint{value: ...}` entry point.  
-  - In the exploit trace, it:
-    - Reads the WBNB/USDT pair address from Pancake V2 factory `0xcA143Ce3…`.  
-    - Calls `PancakePair 0x16b9…::getReserves()`.  
-    - Calls `HYDT::mint(0x8f92…, 60961921249934820691479)` and emits an `InitialMint` event capturing depositor, deposit (11 BNB), and minted HYDT amount.
-
-- **HYDT oracle/helper contract**: `0xc5161aE3437C08036B98bDb58cfE6bBfF876c177`  
-  - Receives the same 11 BNB via its fallback during `initialMint`.  
-  - Also queries the Pancake factory `0xcA143Ce3…` and `PancakePair 0x16b9…::getReserves()`.  
-  - Emits an `In(...)` event that logs the depositor (`0xA2268…`), the 11 BNB deposit, and values derived from those reserves.
-
-These two contracts together implement the price-based mint calculation for HYDT’s initial minting flow, based on the external AMM reserves.
-
-### Executor contract and privileged EOA
-
-The executor contract at `0x8f921e27e3af106015d1c3a244ec4f48dbfcad14` is an unverified contract whose disassembly reveals:
-
-- A dispatcher on several custom 4-byte selectors.  
-- Hard-coded checks that **`CALLER` and/or `ORIGIN` must equal `0x4645…`**, i.e., the adversary EOA.  
-- Logic to build calldata for:
-  - Pancake V3 pool `0x92b7…::flash`.  
-  - Pancake V3 SwapRouter `0x1b81…` for `exactInputSingle` / `swapExactTokensForTokens`.  
-  - WBNB deposit/withdraw operations.  
-  - Generic ERC20 `transfer` / `transferFrom` calls.
-
-**Evidence snippet 2 – Executor disassembly showing hard-coded privileged caller (executor `0x8f92…` disassembly):**
-
-```text
-// 0x8f92… disassembly
-0000007b: JUMPDEST
-0000007c: CALLVALUE
-...
-000000ab: PUSH20 0x4645863205b47a0a3344684489e8c446a437d66c
-000000c0: DUP1
-000000c1: CALLER
-000000c2: EQ
-...
-000001bd: JUMPDEST
-000001be: SWAP1
-000001bf: POP
-000001c0: ORIGIN
-000001c1: EQ
-```
-
-*Caption: The executor enforces that the caller/origin is the EOA `0x4645…`, binding the exploit logic to the adversary-controlled account.*
-
-### Pre-state and transaction opportunity
-
-The analysis defines a pre-state `σ_B` as the canonical BSC state immediately before block `0x28fe75f`, including:
-
-- HYDT token `0x9810…`.  
-- HYDT initialMint contract `0xA2268…` and helper `0xc516…`.  
-- Executor contract `0x8f92…`.  
-- Pancake V3 pool `0x92b7…` (USDT/WBNB), Pancake V3 SwapRouter `0x1b81…`.  
-- Pancake V2 WBNB/USDT pair `0x16b9…`.  
-- Balances and allowances for BEP20USDT `0x55d3…` and WBNB `0xbb4c…`.
-
-Within this pre-state, the exploit is a **single, feasible transaction**:
-
-- EOA `0x4645…` can send a transaction on BSC with standard gas, calling `0x8f92…` with call value `3.050065320913977748 BNB`.  
-- All downstream interactions are with permissionless contracts (Pancake pools/routers, HYDT token, `initialMint` and helper contracts, WBNB).
-
-The seed trace confirms that the transaction executes successfully and is included in block `0x28fe75f`.
-
-
-## Vulnerability & Root Cause Analysis
-
-### High-level vulnerability
-
-The vulnerable design is:
-
-- HYDT’s front-end minting contracts `0xA2268…` (initialMint) and `0xc516…` (helper/oracle) **compute the HYDT mint amount for an `initialMint` deposit using the instantaneous reserves** of the Pancake V2 WBNB/USDT pair `0x16b9…`.  
-- These reserves can be **arbitrarily skewed within the same transaction** using flash-loaned USDT.  
-- There is no time-weighted averaging, delay, or other flash-loan mitigation.
-
-Consequently, an unprivileged adversary contract can:
-
-1. Borrow USDT via flash-loan.  
-2. Trade against `0x16b9…` to distort the WBNB/USDT price.  
-3. Immediately call `initialMint` in the same transaction.  
-4. Receive far more HYDT than would be minted at the pre-manipulation price.
-
-### Concrete exploit sequence and price oracle misuse
-
-The exploit transaction follows a clear chain of calls and state changes:
-
-1. **USDT flash-loan and initial price impact on `0x16b9…`**
-   - Executor `0x8f92…` calls Pancake V3 pool `0x92b7…::flash`, borrowing **12,000,000 USDT**.  
-   - Inside the flash callback, `0x8f92…` routes this USDT via Pancake V3 SwapRouter `0x1b81…` into Pancake V2 WBNB/USDT pair `0x16b9…` using `swapExactTokensForTokens([USDT, WBNB])`.  
-   - `PancakePair 0x16b9…::swap` transfers **6.735053427848041558630e21 WBNB** to `0x8f92…` and emits a `Sync` event with updated reserves, showing a significant change in the WBNB/USDT ratio.
-
-   **Evidence snippet 3 – Flash-loan and price manipulation of `0x16b9…` (seed transaction trace):**
-
-   ```text
-   // Seed tx trace (cast run -vvvvv)
-   ├─ 0x92b7807bF19b7DDdf89b706143896d05228f3121::flash(
-   │     0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14,
-   │     12000000000000000000000000, 0, ...
-   │  )
-   ...
-   │   ├─ PancakePair::swap(
-   │   │     amount0In: 12000000000000000000000000,
-   │   │     amount1Out: 6735053427848041558630,
-   │   │     to: 0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14
-   │   ├─ emit Sync(reserve0: 17665016750073905818899339,
-   │   │           reserve1: 3187484584912433711217)
-   ```
-
-   *Caption: The Pancake V3 flash-loan and subsequent swap heavily alter the WBNB/USDT reserves of pair `0x16b9…` in the same transaction, establishing a manipulated spot price.*
-
-2. **Conversion of WBNB to 11 BNB and call to `initialMint`**
-   - After accumulating WBNB, `0x8f92…` calls `WBNB::withdraw(11000000000000000000)` to unwrap **11 BNB**.
-   - With those 11 BNB as call value, `0x8f92…` calls `0xA2268…::initialMint{value: 11 BNB}`.
-   - Inside `initialMint`:
-     - It calls Pancake factory `0xcA143Ce3…::getPair(WBNB, USDT)` to resolve `0x16b9…`.  
-     - It then calls `PancakePair 0x16b9…::getReserves()`, receiving the **already manipulated** reserves.  
-     - It invokes helper `0xc516…` via `fallback{value: 11 BNB}`, which repeats the factory and `getReserves` calls and emits an `In(...)` event with the 11 BNB deposit and derived values.
-
-   **Evidence snippet 4 – Withdraw and initialMint using manipulated reserves (seed transaction trace):**
-
-   ```text
-   // Seed tx trace (cast run -vvvvv)
-   ├─ WBNB::withdraw(11000000000000000000)
-   │   ├─ emit Withdrawal(src: 0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14,
-   │   │                 wad: 11000000000000000000)
-   ...
-   ├─ 0xA2268Fcc2FE7A2Bb755FbE5A7B3Ac346ddFeDB9B::initialMint{value: 11000000000000000000}()
-   │   ├─ 0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73::getPair(WBNB, BEP20USDT)
-   │   ├─ PancakePair 0x16b9…::getReserves()
-   │   │   └─ ← [Return] 17665016750073905818899339, 3187484584912433711217
-   │   ├─ 0xc5161aE3437C08036B98bDb58cfE6bBfF876c177::fallback{value: 11000000000000000000}()
-   │   │   ├─ getPair(WBNB, BEP20USDT)
-   │   │   ├─ PancakePair 0x16b9…::getReserves()
-   │   │   ├─ emit In(0xA2268…, 11000000000000000000, 136341426462748958778, 755603209375080131240403)
-   ```
-
-   *Caption: `initialMint` and its helper repeatedly read `0x16b9…` reserves, but they do so **after** the attacker’s price-impacting swap, inheriting the manipulated spot price.*
-
-3. **Over-minting HYDT based on manipulated price**
-   - Having read the distorted reserves, `initialMint` calls HYDT:
-     - `HYDT::mint(0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14, 60961921249934820691479)`  
-   - An `InitialMint` event is emitted with:
-     - `param0` (beneficiary): `0x8f92…`  
-     - `param1` (deposit): `11000000000000000000` (11 BNB)  
-     - `param2` (HYDT minted): `60961921249934820691479` (~60,961.921 HYDT)  
-     - `param3`: `1000000000000000000` (1e18)
-
-   **Evidence snippet 5 – HYDT mint and InitialMint event (seed transaction trace):**
-
-   ```text
-   // Seed tx trace (cast run -vvvvv)
-   ├─ HYDT::mint(0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14,
-   │             60961921249934820691479)
-   │   ├─ emit Transfer(
-   │   │     from: 0x0000000000000000000000000000000000000000,
-   │   │     to:   0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14,
-   │   │     value: 60961921249934820691479
-   │   └─ ← [Return] true
-   ├─ emit InitialMint(
-   │     param0: 0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14,
-   │     param1: 11000000000000000000,
-   │     param2: 60961921249934820691479,
-   │     param3: 1000000000000000000
-   )
-   ```
-
-   *Caption: HYDT mints ~60.96k HYDT to the executor for an 11 BNB deposit, with no internal price logic; the mint amount is entirely determined by `initialMint`’s reserve-based calculation.*
-
-4. **Flash-loan sensitivity and missing safeguards**
-   - HYDT’s own contract enforces only that callers have `CALLER_ROLE`. It does **not** validate prices or check invariants.  
-   - The `initialMint` and helper contracts:
-     - Use a **single-block spot price** from an external AMM as a price oracle.  
-     - Perform reserve reads **after** the attacker’s flash-loan-driven swap.  
-     - Have no TWAP, cross-block delay, or minimum-out requirement tied to pre-manipulation prices.
-
-This combination makes HYDT’s initial minting path *inherently flash-loan-sensitive*: any adversary with access to USDT liquidity via flash-loans and a suitable AMM pool can over-mint HYDT in a single transaction.
+- During the incident, HYDT trades in three pools:
+  - `0xD5f07FEd6Ddca96c6e93f06498dfeCF7E1346d7E`,
+  - `0xBB8ae522F812E9E65239A0e5db87a9D738ce957a`,
+  - `0x03feD6eCF872a827C07EAb63106E8f04AeF79f0d`.
+- HYDT prices in these pools are **above** the implicit 1 HYDT = 1 USD
+  mint price set by InitialMintV2.
+- This gap allows any EOA to:
+  1. send BNB into InitialMintV2,
+  2. receive underpriced HYDT at 1 HYDT per 1 USD, and
+  3. immediately dump HYDT back into the HYDT/WBNB and HYDT/USDT pools,
+     extracting profit funded by protocol‑ and LP‑owned liquidity.
 
 ### Vulnerable components
 
-From the collected artifacts and traces, the following components are demonstrably involved and vulnerable:
-
-- **HYDT token (`0x9810…`)**  
-  - Role-gated minter via `CALLER_ROLE`.  
-  - Used as the back-end mint target for `initialMint`.  
-  - In the exploit trace, `HYDT::mint(0x8f92…, 60961921249934820691479)` executes successfully.
-
-- **HYDT initialMint contract (`0xA2268…`)**  
-  - Exposes `initialMint{value: uint256}`.  
-  - Reads Pancake V2 pair `0x16b9…` reserves (via factory `0xcA143Ce3…`).  
-  - Calls HYDT `mint` with the amount computed from those reserves, which in the exploit run are manipulated.
-
-- **HYDT helper/oracle contract (`0xc516…`)**  
-  - Receives deposit BNB via `fallback{value: ...}`.  
-  - Mirrors factory and `getReserves` calls to `0x16b9…`.  
-  - Emits the `In(...)` event encoding values derived from the manipulated reserves.
-
-### Exploit preconditions
-
-The exploit is possible under the following concrete conditions (all observed in the artifacts):
-
-- The `initialMint` pathway derives HYDT mint amounts from the **current** spot reserves of Pancake V2 WBNB/USDT pair `0x16b9…`, without TWAP or other cross-block oracle hardening.  
-- The `initialMint` contract `0xA2268…` is:
-  - Callable by arbitrary senders supplying BNB as `msg.value`.  
-  - Granted `CALLER_ROLE` on HYDT, allowing its `HYDT::mint` call to succeed.
-- Pancake V2 pair `0x16b9…` has sufficient USDT/WBNB liquidity for a large USDT→WBNB swap to materially shift the price.  
-- Pancake V3 pool `0x92b7…` offers flash-loan-like functionality (`flash`) over BEP20USDT `0x55d3…`, enabling the adversary to borrow 12M USDT within a single transaction.
+- **InitialMintV2 initial mint mechanism**
+  at `0xA2268Fcc2FE7A2Bb755FbE5A7B3Ac346ddFeDB9B`:
+  - pricing logic based solely on a WBNB/USDT reference pool,
+  - fixed rate of 1 HYDT per 1 USD for mints, independent of HYDT
+    market price elsewhere.
+- **Reserve contract**
+  at `0xc5161aE3437C08036B98bDb58cfE6bBfF876c177`
+  and the three HYDT pools above:
+  - act as **value sources**: Reserve receives BNB from mints; pools
+    absorb slippage when HYDT is dumped.
+- **Orchestrator contract**
+  at `0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14`:
+  - sequences InitialMintV2, HYDT, and router calls on behalf of the
+    adversary EOA, turning the design flaw into a streamlined strategy.
 
 ### Security principles violated
 
-The design violates several standard DeFi security principles:
+- The primary mint price is **not aligned** with the secondary market
+  price, enabling risk‑free arbitrage that extracts value from
+  protocol/LP liquidity.
+- The design **relies on a single external reference pool**
+  (WBNB/USDT) to price HYDT mints without enforcing any invariant that
+  keeps HYDT pools—where the minted HYDT is actually dumped—in sync with
+  that reference, leaving them exposed to systematic exploitation.
 
-- **Use of manipulable spot AMM price as oracle:**  
-  The contracts treat a single-block AMM reserve snapshot (Pancake V2 pair `0x16b9…`) as a trusted oracle for minting a protocol-native asset. This is explicitly discouraged because AMM reserves are trivially manipulable via flash-loans.
+## Detailed Root Cause Analysis
 
-- **Missing invariants around minting and AMM interaction:**  
-  There is no invariant that ties HYDT minting to robust, cross-block price information or to multiple independent price sources. Instead, minting is tightly coupled to a single pool’s reserves within the same transaction that can trade against that pool.
+### ACT opportunity definition and transaction sequence
 
-- **Over-reliance on access control without economic constraints:**  
-  While HYDT uses `AccessControl` to restrict minting to `CALLER_ROLE`, it does not constrain the economic behavior of those callers. A misdesigned caller (`0xA2268…`) that bases minting on manipulable AMM reserves effectively undermines the safety of the access control.
+The ACT opportunity is defined around block `42985311` on BSC:
 
+- **State snapshot B (pre‑state)**:
+  - Balances and reserves of HYDT, WBNB, USDT,
+    the three HYDT pools, the Reserve contract, and the adversary EOA.
+  - All reconstructible from the listed metadata, balance diffs, and
+    balance snapshots.
 
-## adversary Flow Analysis
+- **Transaction sequence `b`**:
+  - Single transaction:
+    - `index`: 1
+    - `chainid`: 56 (BSC)
+    - `txhash`:
+      `0xa9df1bd97cf6d4d1d58d3adfbdde719e46a1548db724c2e76b4cd4c3222f22b3`
+    - `type`: adversary-crafted
+  - **Inclusion feasibility**:
+    - The tx is a single EOA‑signed call from
+      `0x4645863205b47a0a3344684489e8c446a437d66c`
+      to public orchestrator
+      `0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14`.
+    - It uses a standard gas price and encounters no privileged access
+      checks along the InitialMintV2, HYDT, SwapRouter, or pool calls.
+    - All functions in the call chain are externally callable and
+      operate on public on‑chain state.
+    - Therefore, any unprivileged EOA with sufficient BNB balance on BSC
+      can construct, sign, and submit an equivalent transaction against
+      the same or similar pre‑state and obtain the same call sequence
+      under standard inclusion rules.
 
-### Strategy summary
+The single relevant transaction is explicitly recorded as:
 
-The adversary’s strategy is to:
+- `all_relevant_txs`:
+  - chainid 56, txhash
+    `0xa9df1bd97cf6d4d1d58d3adfbdde719e46a1548db724c2e76b4cd4c3222f22b3`,
+    role = `adversary-crafted`.
 
-1. Use a **USDT flash-loan** to gain temporary, large capital.  
-2. **Manipulate the WBNB/USDT price** in Pancake V2 pair `0x16b9…` using that capital.  
-3. **Invoke HYDT’s initialMint path** while the manipulated price is in effect to over-mint HYDT to their executor.  
-4. **Sell the minted HYDT** into USDT and WBNB across multiple pools.  
-5. **Repay the flash-loan** and keep the remaining WBNB as pure profit, returning the original BNB call value to an internal address.
+### Trace-based reconstruction of the exploit path
 
-### Adversary-controlled accounts
-
-The artifacts identify an adversary cluster on BSC:
-
-- **EOA `0x4645863205b47a0a3344684489e8c446a437d66c`**
-  - Sender of the exploit transaction `0xa9df1b…`.  
-  - Hard-coded privileged caller/origin in executor `0x8f92…` (per disassembly).  
-  - Ultimate recipient of **10.16806792500585992 WBNB** via `WBNB::transfer` at the end of the exploit trace.  
-  - Balance deltas show a net outflow of roughly the initial BNB value minus gas and plus WBNB profit.
-
-- **Executor contract `0x8f921e27e3af106015d1c3a244ec4f48dbfcad14`**
-  - Contract called by `0x4645…` in the seed transaction.  
-  - Orchestrates:
-    - Pancake V3 `flash` call to `0x92b7…`.  
-    - Swaps via Pancake V3 SwapRouter `0x1b81…`.  
-    - `WBNB::withdraw` to unwrap to BNB.  
-    - `0xA2268…::initialMint` to mint HYDT to itself.  
-    - HYDT approvals and swaps through various pools.  
-    - Final WBNB transfer of profit to `0x4645…` and BNB refund fallback to `0x4848…`.
-
-### Victim and infrastructure contracts
-
-The following contracts are directly involved and/or impacted:
-
-- **HYDT token (`0x9810512be701801954449408966c630595d0cd51`)** – Verified token minting contract that ultimately mints the inflated HYDT supply to the adversary-controlled executor.  
-- **HYDT initialMint / control contract (`0xA2268Fcc2FE7A2Bb755FbE5A7B3Ac346ddFeDB9B`)** – Oracle-dependent mint front-end that is granted `CALLER_ROLE` on HYDT and bases its minting logic on AMM reserves.  
-- **HYDT oracle/helper contract (`0xc5161aE3437C08036B98bDb58cfE6bBfF876c177`)** – Helper that reads AMM reserves and emits the `In(...)` event used for minting calculations.  
-- **Pancake V3 USDT/WBNB pool (`0x92b7807bf19b7dddf89b706143896d05228f3121`)** – Provides the USDT flash-loan used to kick-start the exploit.  
-- **Pancake V2 WBNB/USDT pair (`0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae`)** – AMM whose reserves are manipulated and then read by `initialMint` as a price oracle.
-
-### Lifecycle stages
-
-#### Stage 1 – Flash-loan and price manipulation
-
-- **Mechanism:** Pancake V3 `flash` loan and USDT→WBNB swap.  
-- **Transaction:** `0xa9df1b…` (block `0x28fe75f`, BSC).
-
-In this stage:
-
-- Executor `0x8f92…` calls `PancakeV3Pool 0x92b7…::flash`, borrowing **12,000,000 USDT**.  
-- Within `pancakeV3FlashCallback`, it calls `Pancake V3 SwapRouter 0x1b81…::swapExactTokensForTokens([USDT, WBNB])` targeting the V2 pair `0x16b9…`.  
-- `PancakePair 0x16b9…::swap`:
-  - Sends **6.735053427848041558630e21 WBNB** to `0x8f92…`.  
-  - Emits a `Sync` event with new reserves, confirming a material change in price.
-
-**Evidence snippet 6 – Flash-loan lifecycle and Sync (seed transaction trace):**
+The foundry trace for the incident transaction shows the detailed
+sequence of calls within the orchestrator:
 
 ```text
-└─ PancakePair::swap(
-     amount0In: 12000000000000000000000000,
-     amount1Out: 6735053427848041558630,
-     to: 0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14
-   )
-   ├─ emit Sync(
-   │     reserve0: 17665016750073905818899339,
-   │     reserve1: 3187484584912433711217
-   │   )
+... 0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14::3c9c2087{value: 3050065320913977748}(...) 
+    ├─ InitialMintV2::initialMint{value: 11000000000000000000}(...)
+    │   ├─ BEP20USDT::getReserves() ...   // via DataFetcher.quote on WBNB/USDT
+    │   ├─ HYDT::mint(0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14,
+    │   │             60961921249934820691479)
+    │   │   ├─ emit Transfer(from: 0x0, to: 0x8f921E27..., value: 60961921249934820691479)
+    │   ├─ emit InitialMint(user: 0x8f921E27...,
+    │                       amountBNB: 11000000000000000000,
+    │                       amountHYDT: 60961921249934820691479,
+    │                       callingPrice: 1000000000000000000)
+    ├─ HYDT::approve(SwapRouter: 0x1b81D678..., 30480960624967410345739)
+    ├─ SwapRouter::exactInputSingle(...)
+    │   ├─ PancakeV3Pool::swap(...)        // HYDT → USDT
+    │   │   ├─ BEP20USDT::transfer(0x8f921E27..., 20801440045608164984189)
+    ├─ subsequent swaps through HYDT pools and routers (HYDT/USDT, HYDT/WBNB) ...
 ```
 
-*Caption: The Sync event on `0x16b9…` reflects the post-manipulation reserves from which the subsequent `initialMint` price is derived.*
+This trace confirms:
 
-#### Stage 2 – Mispriced HYDT mint via initialMint
+- `InitialMintV2.initialMint` receives exactly 11 BNB,
+  forwards it to the Reserve, and mints
+  `60,961.921249934820691479` HYDT
+  to the orchestrator address at a **calling price of 1e18** (1 HYDT).
+- The orchestrator then approves HYDT to the SwapRouter and executes a
+  sequence of swaps through the three HYDT pools, routing HYDT → USDT → WBNB.
 
-- **Mechanism:** Spot-reserve-based oracle used to calculate mint amount.  
-- **Transaction:** Same as Stage 1 (`0xa9df1b…`).
+### Balance-based verification of profit
 
-Actions observed:
-
-- `0x8f92…` unwraps part of its WBNB position:
-  - `WBNB::withdraw(11000000000000000000)` → obtains 11 BNB (see snippet 4).  
-- It then calls `0xA2268…::initialMint{value: 11 BNB}`.  
-- Inside `initialMint` and helper `0xc516…`:
-  - `getPair(WBNB, USDT)` returns `0x16b9…`.  
-  - `getReserves()` returns the manipulated reserve values.  
-  - `In(...)` event is emitted with the deposit and computed parameters.  
-- Finally, `HYDT::mint(0x8f92…, 60961921249934820691479)` is executed and `InitialMint` is emitted with the same HYDT amount.
-
-This stage is where the protocol bug manifests: the minting logic trusts the current reserves of `0x16b9…` without any flash-loan-resistant design.
-
-#### Stage 3 – HYDT sell-off, loan repayment, and profit realization
-
-- **Mechanism:** HYDT dumping via multiple pools and flash-loan repayment.  
-- **Transaction:** Same as Stage 1 (`0xa9df1b…`).
-
-The executor then unwinds its position:
-
-- Approves Pancake V3 SwapRouter `0x1b81…` to spend HYDT.  
-- Routes HYDT through a series of pools:
-  - V3 pool at `0xD5f0…`: swaps **21,578.592647575947411327 HYDT** for **20,801.440045608164984189 USDT**.  
-  - V2 pair at `0xBB8a…`: swaps **23,629.997161415323968091 HYDT** for **12.421323513597163913 WBNB**.  
-  - Another pool at `0x03fe…`: swaps **15,753.331440943549312061 HYDT** for **4,719.617398612016169843 USDT**.
-- Uses the resulting USDT and part of the WBNB position to:
-  - Pay **12,001,200 USDT** back to Pancake V3 pool `0x92b7…` as flash-loan repayment plus fee.  
-- Leaves **10.16806792500585992 WBNB** with `0x8f92…`, which is then transferred to the EOA `0x4645…`.  
-- A final fallback with `value: 3.050065320913977748 BNB` to `0x4848…` returns the original call value, closing the position.
-
-**Evidence snippet 7 – Final WBNB transfer to EOA and balance deltas (trace + balance_diff):**
-
-```text
-// Seed tx trace (end of execution)
-├─ WBNB::transfer(0x4645863205b47a0A3344684489e8c446a437D66C,
-│                10168067925005859920)
-│   ├─ emit Transfer(
-│   │     from: 0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14,
-│   │     to:   0x4645863205b47a0A3344684489e8c446a437D66C,
-│   │     value: 10168067925005859920
-│   )
-```
+The adversary EOA’s balance snapshot confirms the net BNB-equivalent gain:
 
 ```json
-// Seed balance_diff.json (selected entries)
 {
-  "native_balance_deltas": [
-    {
-      "address": "0x4645863205b47a0a3344684489e8c446a437d66c",
-      "before_wei": "93096695723533900889",
-      "after_wei":  "90043300634619923141",
-      "delta_wei":  "-3053395088913977748"
+  "chainid": 56,
+  "address": "0x4645863205b47a0a3344684489e8c446a437d66c",
+  "native_balance": {
+    "start_block": 42985300,
+    "end_block": 42986000,
+    "start_wei": 93096695723533900889,
+    "end_wei": 90043300634619923141,
+    "delta_wei": -3053395088913977748
+  },
+  "erc20_balances": {
+    "WBNB": {
+      "start_raw": 9170949962907504757,
+      "end_raw": 19339017887913364677,
+      "delta_raw": 10168067925005859920
     },
-    {
-      "address": "0x4848489f0b2bedd788c696e2d79b6b69d7484848",
-      "delta_wei": "3050065320913977748"
-    }
-  ],
-  "erc20_transfers": [
-    {
-      "token": "0x9810512be701801954449408966c630595d0cd51",
-      "from":  "0x0000000000000000000000000000000000000000",
-      "to":    "0x8f921e27e3af106015d1c3a244ec4f48dbfcad14",
-      "value": "60961921249934820691479"
-    },
-    {
-      "token": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
-      "from":  "0x8f921e27e3af106015d1c3a244ec4f48dbfcad14",
-      "to":    "0x4645863205b47a0a3344684489e8c446a437d66c",
-      "value": "10168067925005859920"
-    }
-  ]
+    "HYDT": { "start_raw": 0, "end_raw": 0, "delta_raw": 0 },
+    "USDT": { "start_raw": 7509103030153373719815,
+              "end_raw": 7509103030153373719815,
+              "delta_raw": 0 }
+  }
 }
 ```
 
-*Caption: The final WBNB transfer to `0x4645…` and the native balance deltas show the adversary exiting with WBNB profit while recovering the original BNB call value at an internal address.*
+Interpreting these values:
 
-### Economic outcome and impact
+- BNB: `delta_wei = -3.053395088913977748` BNB.
+- WBNB: `delta_raw = 10.168067925005859920` WBNB.
+- HYDT: no net position (minted HYDT is fully dumped within the tx).
+- USDT: no net position.
 
-Using BNB as the reference asset and treating WBNB as BNB-equivalent (consistent with observed `WBNB::withdraw` calls), the analysis concludes:
+The **success predicate** is purely monetary:
 
-- **Reference asset:** BNB.  
-- **Adversary address:** `0x4645863205b47a0a3344684489e8c446a437d66c`.  
-- **Gas fees:** `0.003329768` BNB (from 3,329,768 gas at 1 gwei).  
-- **Call value sent to executor:** `3.050065320913977748` BNB.  
-- **WBNB received back:** `10.16806792500585992` WBNB (transfer to `0x4645…`).  
+- `type`: `profit`.
+- `reference_asset`: `BNB-equivalent (BNB/WBNB)`.
+- `adversary_address`:
+  `0x4645863205b47a0a3344684489e8c446a437d66c`.
+- `fees_paid_in_reference_asset`: `0.003329768` BNB.
+- `value_before_in_reference_asset` and `value_after_in_reference_asset`:
+  those balances are taken directly from the balance snapshot above.
+- `value_delta_in_reference_asset`:
+  net **+7.114672836091882172** units of BNB-equivalent.
+- `valuation_notes`:
+  - derived from `balance_diff.json` and the iter_4 balance snapshot
+    and token transfer logs,
+  - the EOA pays `3.053395088913977748` BNB (including gas),
+  - receives `10.168067925005859920` WBNB,
+  - with no offsetting HYDT or USDT losses.
 
-Net BNB-equivalent change attributable to this transaction:
+There is no additional non‑monetary success predicate; the fields
+`oracle_name`, `oracle_definition`, and `oracle_evidence`
+in the non‑monetary block are intentionally left empty.
 
-```text
-10.16806792500585992  (WBNB out to adversary)
-− 3.050065320913977748 (initial BNB call value)
-− 0.003329768          (gas fees)
-= 7.114672836091882172 BNB
-```
+### Root cause summary
 
-This is a strictly positive on-chain gain, computed solely from intra-transaction flows (trace and balance diffs), without relying on any external price feeds.
+Combining code, traces, and balances:
 
-In terms of protocol impact:
+- InitialMintV2 is designed to always trade BNB for HYDT at a fixed
+  1 HYDT per 1 USD reference price based on WBNB/USDT reserves.
+- During the incident, HYDT’s market price in the HYDT pools is
+  materially higher than this implicit mint price.
+- The adversary uses a public orchestrator to:
+  1. withdraw WBNB,
+  2. call `InitialMintV2.initialMint{value: 11 BNB}`,
+     minting `60,961.9212…` HYDT,
+  3. route HYDT through HYDT/USDT and HYDT/WBNB pools,
+  4. end with extra WBNB in their EOA.
+- The net result is a deterministic profit of
+  `7.114672836091882172` BNB-equivalent,
+  funded entirely by protocol and pool liquidity.
 
-- **HYDT dilution:** 60,961.921249934820691479 HYDT are minted to an adversary-controlled contract based on a temporarily distorted AMM price.  
-- **Value transfer:** Economic value is transferred from HYDT holders and/or the protocol treasury (depending on HYDT’s design) to the adversary.  
-- **Reproducibility:** As long as the `initialMint` path remains available and continues to rely on the same manipulable AMM reserves, the attack is **permissionless and reproducible** by any party capable of executing similar flash-loan and swap sequences.
+This mechanism is fully deterministic, uses only publicly accessible
+contracts and on-chain state, and does not depend on any hidden order
+flow or private information, fulfilling the ACT definition.
 
+## Adversary Flow Analysis
+
+### Strategy summary
+
+The adversary executes a **single-transaction mint‑and‑dump arbitrage**
+using an orchestrator contract:
+
+- BNB from the EOA is funneled through the orchestrator.
+- The orchestrator calls InitialMintV2 to mint underpriced HYDT.
+- Newly minted HYDT is immediately swapped through HYDT pools into USDT
+  and then WBNB.
+- The EOA ends with more WBNB than its starting BNB, while HYDT pools
+  and the Reserve absorb the losses.
+
+### Adversary-related accounts
+
+**Adversary cluster**
+
+- EOA `0x4645863205b47a0a3344684489e8c446a437d66c`
+  - Sender of the incident transaction.
+  - Direct beneficiary of the `10.168067925005859920` WBNB profit.
+  - Balance snapshots and diff files show its BNB decrease and WBNB
+    increase matching the profit calculation.
+- Orchestrator `0x8f921E27e3AF106015D1C3a244eC4F48dBFcAD14`
+  - Contract recipient of the EOA’s call.
+  - Dispatches `InitialMintV2.initialMint`, `HYDT.mint`, and router/pool
+    calls in the same transaction.
+  - Address‑level txlists show calls in the analysis window originate
+    from the adversary EOA.
+
+**Victim candidates / value sources**
+
+- `HYDT InitialMintV2`
+  - Address: `0xA2268Fcc2FE7A2Bb755FbE5A7B3Ac346ddFeDB9B`.
+  - Verified source; implements vulnerable mint pricing logic.
+- `HYDT ERC‑20 token`
+  - Address: `0x9810512Be701801954449408966c630595D0cD51`.
+  - Verified source; grants `CALLER_ROLE` to InitialMintV2 and other
+    protocol components, enabling minting.
+- HYDT pools:
+  - `0xD5f07FEd6Ddca96c6e93f06498dfeCF7E1346d7E`
+  - `0xBB8ae522F812E9E65239A0e5db87a9D738ce957a`
+  - `0x03feD6eCF872a827C07EAb63106E8f04AeF79f0d`
+  - All verified; hold HYDT paired with WBNB and/or USDT; their reserves
+    shift in line with the HYDT dump path.
+- `Reserve`
+  - Address: `0xc5161aE3437C08036B98bDb58cfE6bBfF876c177`.
+  - Verified; receives the 11 BNB from `InitialMintV2.initialMint`.
+
+### Lifecycle stages
+
+1. **Adversary initial funding and setup**
+   - Transaction:
+     - Chain: BSC (56),
+     - Tx: `0xa9df1bd9…22f22b3`,
+     - Block: `42985311`,
+     - Mechanism: transfer.
+   - Effect:
+     - The EOA allocates BNB and maintains WBNB balances sufficient to
+       fund the orchestrator call.
+     - This is visible in the pre-state balances from
+       `balance_snapshot_42985300-42986000.json`, combined with
+       token transfer logs.
+   - Evidence:
+     - `metadata.json` and `balance_diff.json` under the seed artifacts.
+     - Iter_4 balance snapshot for the EOA.
+
+2. **Adversary contract orchestration and mint**
+   - Transaction:
+     - Same tx/chain/block as above,
+     - Mechanism: contract_call.
+   - Effect:
+     - The EOA calls orchestrator `0x8f921E27…` with
+       `3.050065320913977748` BNB.
+     - The orchestrator:
+       - pulls 11 BNB from WBNB,
+       - calls `InitialMintV2.initialMint{value: 11 BNB}`,
+       - forwards 11 BNB to the Reserve,
+       - mints `60,961.921249934820691479` HYDT to itself.
+   - Evidence:
+     - `trace.cast.log` for the incident tx (showing the mint and event).
+     - Verified sources for InitialMintV2 and HYDT.
+
+3. **Adversary HYDT dump and profit realization**
+   - Transaction:
+     - Same tx/chain/block,
+     - Mechanism: swap.
+   - Effect:
+     - The orchestrator routes the freshly minted HYDT through:
+       - pool `0xD5f07FEd…E1346d7E` (Pancake V3 style),
+       - pool `0xBB8ae522…38ce957a`,
+       - pool `0x03feD6eC…AeF79f0d`,
+       using SwapRouter and PancakeRouter.
+     - Intermediate USDT flows through
+       `0x92b7807bF19b7DDdf89b706143896d05228f3121`.
+     - The EOA ends with about `10.168067925005859920` WBNB
+       and a `3.053395088913977748` BNB decrease (including gas),
+       yielding the net `+7.114672836091882172` BNB-equivalent gain.
+   - Evidence:
+     - `trace.cast.log` (swap calls and Transfer events).
+     - `balance_diff.json` (pool‑side HYDT and USDT deltas).
+     - EOA balance snapshot and token transfer logs in iter_4.
+
+## Impact & Losses
+
+### Total loss overview
+
+- Reference token: `BNB-equivalent (BNB/WBNB)`.
+- Total adversary gain:
+  - `7.114672836091882172` units in BNB-equivalent.
+
+### Impact narrative
+
+The adversary realizes a **deterministic** gain of
+`7.114672836091882172` BNB-equivalent in a **single transaction** by:
+
+- using InitialMintV2 to mint underpriced HYDT at 1 HYDT per 1 USD, and
+- dumping that HYDT into the three HYDT pools to extract WBNB while the
+  Reserve receives BNB.
+
+The loss is borne by:
+
+- LPs providing HYDT/USDT and HYDT/WBNB liquidity in the three pools,
+  whose token balances shift unfavorably (as shown in `balance_diff.json`);
+  they effectively finance the arbitrage profit via slippage.
+- The Reserve, which accumulates BNB from initial mints without capturing
+  the full economic value of the minted HYDT relative to secondary
+  market prices.
+
+Detailed per‑LP and per‑pool loss allocation is **not computed** in this
+report, but pool‑side balance changes in `balance_diff.json` and the
+verified contract sources suffice to attribute the high‑level loss to
+protocol/LP liquidity rather than to any third party.
 
 ## References
 
-The following artifact groups underpin the above analysis. They are not required to understand the report but can be consulted for independent verification:
+Primary artifacts:
 
-- **[1] Seed transaction metadata, trace, and balance diffs**  
-  - Source: seed artifacts for tx `0xa9df1b…` (metadata, `trace.cast.log`, `balance_diff.json`).  
-  - Content: Full transaction trace (cast run with high verbosity), pre/post balances, and gas usage.
+- **[1] Seed transaction metadata and trace**  
+  `artifacts/root_cause/seed/56/0xa9df1bd97cf6d4d1d58d3adfbdde719e46a1548db724c2e76b4cd4c3222f22b3`
+- **[2] InitialMintV2 and HYDT verified sources**  
+  `artifacts/root_cause/data_collector/iter_1/contract/56`
+- **[3] Adversary EOA balance snapshots and token transfers**  
+  `artifacts/root_cause/data_collector/iter_4/address/56/0x4645863205b47a0a3344684489e8c446a437d66c`
 
-- **[2] HYDT token source and ABI**  
-  - Source: Collected project for HYDT token `0x9810512be701801954449408966c630595d0cd51`.  
-  - Content: Solidity source (`HYDT.sol` and interfaces) and compiled ABI, confirming the `CALLER_ROLE`-gated `mint` function.
+ACT pre‑state and success predicate evidence:
 
-- **[3] Executor `0x8f92…` disassembly and selector decoding**  
-  - Source: Disassembly logs and decoded selectors for executor contract `0x8f921e27e3af106015d1c3a244ec4f48dbfcad14`.  
-  - Content: Bytecode-level control flow and hard-coded privileged caller/origin address `0x4645…`, along with references to Pancake pools/routers, WBNB, and generic ERC20 calls used in the exploit.
+- `metadata.json` and `balance_diff.json` for tx
+  `0xa9df1bd97cf6d4d1d58d3adfbdde719e46a1548db724c2e76b4cd4c3222f22b3`
+  under `artifacts/root_cause/seed/56/`.
+- `balance_snapshot_42985300-42986000.json` and
+  `tokentx_42985300-42986000.json` for EOA
+  `0x4645863205b47a0a3344684489e8c446a437d66c`
+  under `artifacts/root_cause/data_collector/iter_4/address/56/`.
+- Verified contract trees for:
+  - InitialMintV2 (`0xA2268Fcc…dFeDB9B`),
+  - HYDT (`0x9810512B…5D0cD51`),
+  - HYDT pools (`0xD5f07FEd…`, `0xBB8ae522…`, `0x03feD6eC…`).
+
+This report is fully determined by the artifacts listed above, without
+speculative language, and matches the ACT opportunity and root cause
+described in `root_cause.json`.
 

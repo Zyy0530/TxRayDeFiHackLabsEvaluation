@@ -1,485 +1,318 @@
-# Clober Rebalancer WETH/0xd3c8 Pool Drain via Attacker‑Controlled Token and Flash‑Loan Mint/Burn (Base, chainid 8453)
+## Incident Overview TL;DR
 
-## Metadata
+On Base (chainid 8453), an unprivileged EOA `0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025` deployed a custom strategy contract `0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1` and, in the same block (`23514451`), executed a flash-loan-backed transaction `0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04` that drained `133.7` WETH9 from a shared Rebalancer locker. The strategy borrowed `267.4` WETH9 from Morpho (`0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb`), minted and burned positions via Rebalancer `0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895` and BookManager `0x382CCccbD3b142D7DA063bF68cd0c89634767F76`, repaid the flash loan principal, and unwrapped the remaining `133.7` WETH9 to ETH for the EOA.
 
-- **Protocol name:** Clober v2 Rebalancer  
-- **Incident category:** protocol_bug  
-- **ACT candidate:** `is_act = true` (single adversary‑crafted tx satisfying a clear profit predicate)
+Pre-/post-state native and ERC-20 balance diffs show:
+- The attacker EOA’s native balance increases by `133540501283062363385` wei over the exploit block.
+- Rebalancer’s WETH9 ERC-20 balance decreases by exactly `133700000000000000000` wei.
+- The WETH9 contract’s native balance decreases by the same `133700000000000000000` wei as it is unwrapped to ETH.
 
-This report analyzes exploit transaction `0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04` on Base (chainid 8453), where a Clober Rebalancer pool pairing WETH9 with an attacker‑controlled ERC20 (`0xd3c8d0cd07Ade92df2d88752D36b80498cA12788`) is drained of 133.7 WETH9 backing via a flash‑loan‑funded mint/burn sequence.
+The root cause is a protocol-level accounting bug in the Rebalancer/BookManager design: currency deltas for all pools are aggregated under a single locker address (`address(this)` in Rebalancer) instead of being tracked per pool key. As a result, an attacker-controlled, newly created pool can withdraw historical positive WETH9 currency delta that belongs to other participants, realizing it as immediate profit in a single flash-loan-backed transaction.
 
-## Incident Overview & TL;DR
-
-**Incident brief**
-
-On Base (8453), an unprivileged adversary cluster consisting of:
-
-- EOA `0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025`, and  
-- Attacker contract `0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1`
-
-executes a single flash‑loan‑funded transaction `0x8fcdfc...c04` that drains **133.7 WETH9** from a Clober v2 Rebalancer pool pairing WETH9 (`0x4200…0006`) with attacker‑controlled token `0xd3c8d0cd07Ade92df2d88752D36b80498cA12788`.
-
-The attacker:
-
-- Borrows **267.4 WETH9** via Morpho.  
-- Uses token `0xd3c8…` and Rebalancer’s mint/burn logic to reduce the WETH9 reserves backing the pool’s LP supply by exactly **133.7 WETH9**.  
-- Repays the flash loan.  
-- Withdraws the surplus as native ETH and sends it to the EOA `0x012F…6025`.
-
-**Root cause brief**
-
-Rebalancer and BookManager treat an attacker‑controlled ERC20 (`0xd3c8…`) as a fully trusted pool asset in WETH9/0xd3c8 LP accounting.
-
-Because:
-
-- The ERC20 is controlled by the attacker contract and can arbitrarily mint, and  
-- LP accounting and BookManager currency deltas do not enforce a hard conservation constraint that ties WETH9 reserves to honest value on the 0xd3c8 side,
-
-the adversary can, in a single flash‑loan‑triggered `open/mint/rebalance/burn` sequence, mint `0xd3c8…` both to Rebalancer and to themselves at no ETH cost, while extracting **133.7 WETH9 more than contributed**. Subsequent LP `burn()` calls for this pool become insolvent on the WETH9 side and revert.
+This incident satisfies the ACT (anyone-can-take) criteria: the exploit strategy is fully permissionless, relies only on canonical on-chain data and public contract interfaces, and is reproducible by any unprivileged EOA capable of broadcasting transactions with sufficient gas and fees.
 
 ## Key Background
 
-### Core contracts and roles
+- **Protocol components and roles**
+  - **Rebalancer** `0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895` acts as a *locker* on top of **BookManager** `0x382CCccbD3b142D7DA063bF68cd0c89634767F76`, holding pooled WETH9 (`0x4200000000000000000000000000000000000006`) and token `0xd3c8d0cd07Ade92df2d88752D36b80498cA12788` on behalf of strategies and LPs across multiple books.
+  - BookManager tracks per-book trading and settlement but exposes *currency deltas* against locker addresses rather than per-pool state. In Rebalancer, all pools share the same locker identity (`address(this)`), so deltas from different pool keys accumulate at the Rebalancer address.
+  - Morpho at `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` provides permissionless WETH9 flash loans.
+  - WETH9 (`0x4200000000000000000000000000000000000006`) supports standard `deposit`/`withdraw` functions, mapping ERC-20 balances to native ETH.
 
-- **BookManager (`0x382C…6776`)**  
-  Clober v2 BookManager manages orderbooks and *currency deltas* for base/quote token pairs. It exposes a `lock()` + `settle()` interface; lockers must leave all currency deltas at zero after their operations.
+- **Adversary-controlled strategy contract**
+  - The strategy contract `0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1` is deployed by EOA `0x012F...` in transaction `0x4fe2383c6dc0f03e53ea5ad4dd3b87c058c960234e57855fb49a9935a810a290` (same block `23514451` as the exploit).
+  - Normal transaction history for `0x32Fb...` shows it is created by and then called only by that EOA around the incident block, linking it tightly to the adversary cluster.
 
-- **Rebalancer (`0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895`)**  
-  Rebalancer sits on top of BookManager, opening pools for token pairs (here WETH9 and `0xd3c8…`), minting ERC6909 LP tokens, and using strategies such as SimpleOracleStrategy to place and clear orders. Its `burn()` function relies on:
-  - Internal reserves, plus  
-  - BookManager currency deltas,  
-  to redeem LP shares into underlying tokens.
+- **Pre-state reconstruction (sigma_B)**
+  - The ACT opportunity is defined at pre-block `0x166cd52` (block `23514450`), immediately before the exploit block `0x166cd53` (`23514451`).
+  - The pre-state sigma_B (`σ_B`) is reconstructed using:
+    - Seed tx metadata for `0x8fcdfc...`  
+      `artifacts/root_cause/seed/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/metadata.json`
+    - BookManager sigma_B P/L view at pre-block `0x166cd52`  
+      `artifacts/root_cause/data_collector/iter_6/address/8453/0x382CCccbD3b142D7DA063bF68cd0c89634767F76_books_sigma_B_PL_view_pre_0x166cd52.json`
+    - WETH9 ERC-20 balance diff across pre/post blocks `0x166cd52` / `0x166cd53`  
+      `artifacts/root_cause/data_collector/iter_6/tx/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/erc20_balance_diff_pre_0x166cd52_post_0x166cd53.json`
+  - These artifacts jointly fix Rebalancer’s WETH9 position, the locker balances, and the per-book sigma_B view of historical P/L prior to the exploit.
 
-- **SimpleOracleStrategy (`0x9092…dda5`)**  
-  A strategy contract computing desired order sizes from an oracle and Clober tick math. It never moves tokens directly; custody is always via Rebalancer and BookManager.
+## Vulnerability Analysis
 
-**Rebalancer contract snippet (verified source on Base)**
+The core vulnerability is *lack of per-pool accounting isolation* for locker currency deltas in the Rebalancer/BookManager integration:
 
-_Origin: Collected verified Rebalancer.sol for `0x6A0b87…F3895` (Base chain)._
+- Rebalancer defines pools keyed by `bytes32` but uses a single BookManager locker address (`address(this)`) for all of them.
+- BookManager exposes currency deltas (`getCurrencyDelta(locker, currency)`) at the locker level, aggregating contributions from all books and hooks.
+- In Rebalancer, the same aggregated locker-level delta is used when updating reserves and computing withdrawals for a specific pool, without segregating deltas per pool key or enforcing that withdrawals are limited to that pool’s own deposits and P/L.
+
+This design allows a newly created, attacker-controlled pool to:
+- Reference existing WETH9/`0xd3c8...` books that have accumulated historical WETH9 gains at the locker.
+- Execute a mint/burn sequence that settles against the **global locker-wide WETH9 currency delta** rather than the pool’s own economic contribution.
+- Withdraw WETH9 that economically belongs to historical LPs/traders of other pools and books.
+
+The vulnerable components are:
+- **Rebalancer** contract `0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895` on chainid 8453 (locker accounting over BookManager).
+- **BookManager** contract `0x382CCccbD3b142D7DA063bF68cd0c89634767F76` on chainid 8453 (currency delta exposure by locker address).
+- **Seed exploit transaction** `0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04` on chainid 8453, which exercises the accounting bug via a flash-loan-backed strategy.
+
+Security principles violated:
+- **Per-pool accounting isolation**: state and P/L that should be segregated per pool key are aggregated at the locker address, allowing cross-pool value leakage.
+- **Conservation of value for LP/trader positions**: historical WETH9 gains attributable to prior counterparties are withdrawable by a newly created, attacker-controlled pool.
+- **Invariant enforcement around locker balances**: the protocol does not enforce that withdrawals from a pool correspond only to that pool’s own deposits and trade P/L.
+
+## Detailed Root Cause Analysis
+
+### Rebalancer locker accounting over BookManager
+
+Rebalancer integrates with BookManager via a locker interface. The key settlement path is:
 
 ```solidity
-// Collected Clober Rebalancer implementation (excerpt)
-contract Rebalancer is IRebalancer, ILocker, Ownable2Step, ERC6909Supply {
-    using BookIdLibrary for IBookManager.BookKey;
-    using SafeERC20 for IERC20;
+// Rebalancer.sol – burn path and currency settlement
+function _burn(bytes32 key, address user, uint256 burnAmount)
+    public
+    selfOnly
+    returns (uint256 withdrawalA, uint256 withdrawalB)
+{
+    Pool storage pool = _pools[key];
+    uint256 supply = totalSupply[uint256(key)];
 
-    IBookManager public immutable bookManager;
+    (uint256 canceledAmountA, uint256 canceledAmountB, uint256 claimedAmountA, uint256 claimedAmountB) =
+        _clearPool(key, pool, burnAmount, supply);
 
-    mapping(bytes32 key => Pool) private _pools;
-    mapping(BookId => BookId) public bookPair;
-    // ...
+    uint256 reserveA = pool.reserveA;
+    uint256 reserveB = pool.reserveB;
+
+    withdrawalA = (reserveA + claimedAmountA) * burnAmount / supply + canceledAmountA;
+    withdrawalB = (reserveB + claimedAmountB) * burnAmount / supply + canceledAmountB;
+
+    _burn(user, uint256(key), burnAmount);
+    pool.strategy.burnHook(msg.sender, key, burnAmount, supply);
+
+    IBookManager.BookKey memory bookKeyA = bookManager.getBookKey(pool.bookIdA);
+
+    pool.reserveA = _settleCurrency(bookKeyA.quote, reserveA) - withdrawalA;
+    pool.reserveB = _settleCurrency(bookKeyA.base, reserveB) - withdrawalB;
+}
+
+function _settleCurrency(Currency currency, uint256 liquidity) internal returns (uint256) {
+    bookManager.settle(currency);
+
+    int256 delta = bookManager.getCurrencyDelta(address(this), currency);
+    if (delta > 0) {
+        bookManager.withdraw(currency, address(this), uint256(delta));
+        liquidity += uint256(delta);
+    } else if (delta < 0) {
+        currency.transfer(address(bookManager), uint256(-delta));
+        bookManager.settle(currency);
+        liquidity -= uint256(-delta);
+    }
+    return liquidity;
 }
 ```
 
-This structure confirms that each pool is keyed only by token addresses and strategy parameters, and that Rebalancer manages LP issuance/redemption while delegating orderbook storage and currency deltas to BookManager.
+Key observations:
+- `_settleCurrency` calls `bookManager.getCurrencyDelta(address(this), currency)` **without specifying a pool key or book ID**. Any positive currency delta accumulated at the locker across *all* books is pulled into `liquidity`.
+- `_burn` uses `_settleCurrency` to update `pool.reserveA` and `pool.reserveB` for the specific `key`, then computes withdrawals as a function of those reserves and the pool’s LP supply.
+- There is no mechanism to:
+  - Track per-pool currency deltas, or
+  - Restrict withdrawals so they only consume the pool’s own contributions and P/L.
 
-### Attacker‑controlled token 0xd3c8…
+Thus, if historical trading and LP activity in other WETH9/`0xd3c8...` books have produced a positive WETH9 delta at the locker, *any* pool that shares the locker address can, upon `burn`, withdraw part or all of this accumulated WETH9.
 
-Token `0xd3c8d0cd07Ade92df2d88752D36b80498cA12788` acts like an ERC20:
+### Evidence from pre-/post-state balances
 
-- Its **slot 0** stores an owner/admin address, and  
-- Its **slot 1 mapping** records balances for addresses such as Rebalancer.
-
-Collected storage for slot 0 shows that the owner is the attacker contract:
-
-_Origin: Collected storage read (slot 0) for token `0xd3c8…` at the exploit block._
+The pre/post ERC-20 balance diff for WETH9 across blocks `0x166cd52` and `0x166cd53` shows:
 
 ```json
+// WETH9 ERC-20 balance diff (pre 0x166cd52 -> post 0x166cd53)
 {
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": "0x00000000000000000000000032fb1bedd95bf78ca2c6943ae5aeaeaafc0d97c1"
+  "0x4200000000000000000000000000000000000006": {
+    "0x012fc6377f1c5ccf6e29967bce52e3629aaa6025": {
+      "before": "1092334517332237561",
+      "after": "1092334517332237561",
+      "delta": "0"
+    },
+    "0x32fb1bedd95bf78ca2c6943ae5aeaeaafc0d97c1": {
+      "before": "0",
+      "after": "0",
+      "delta": "0"
+    },
+    "0x382ccccbd3b142d7da063bf68cd0c89634767f76": {
+      "before": "2414641672943344102",
+      "after": "2414641672943344102",
+      "delta": "0"
+    },
+    "0x6a0b87d6b74f7d5c92722f6a11714dbeda9f3895": {
+      "before": "133707875556674808577",
+      "after": "7875556674808577",
+      "delta": "-133700000000000000000"
+    },
+    "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb": {
+      "before": "28190570621762065045871",
+      "after": "28190570621762065045871",
+      "delta": "0"
+    }
+  }
 }
 ```
 
-This proves that `0x32Fb1B…97C1` controls the token.
+Caption: *WETH9 ERC-20 balance diff across pre/post blocks `0x166cd52`/`0x166cd53`, showing a `-133.7` WETH9 change at the Rebalancer locker and no offsetting WETH9 deltas at the attacker EOA, strategy contract, BookManager, or Morpho.*
 
-State diffs around the exploit transaction show that, within a single tx, the slot‑1 balance mapping for:
+The native balance diff for the exploit transaction further shows:
 
-- Rebalancer `0x6A0b87…F3895`, and  
-- Attacker contract `0x32Fb1B…97C1`
+```json
+// Native balance deltas for tx 0x8fcdfc...
+{
+  "native_balance_deltas": [
+    {
+      "address": "0x012fc6377f1c5ccf6e29967bce52e3629aaa6025",
+      "before_wei": "1153475443767715212",
+      "after_wei": "134693976726830078597",
+      "delta_wei": "133540501283062363385"
+    },
+    {
+      "address": "0x4200000000000000000000000000000000000006",
+      "before_wei": "229548026276542983668186",
+      "after_wei": "229414326276542983668186",
+      "delta_wei": "-133700000000000000000"
+    }
+  ]
+}
+```
 
-are both increased without any ETH inflow, confirming that 0xd3c8… can mint arbitrarily in‑tx to both the pool and the attacker.
+Caption: *Prestate native balance diff for tx `0x8fcdfc...`, showing the attacker EOA’s native balance increasing by ~`133.54` ETH while the WETH9 contract’s native balance decreases by exactly `133.7` ETH.*
 
-### Summary of preliminary knowledge
+Combined, these diffs demonstrate that:
+- `133.7` WETH9 leaves the Rebalancer locker as ERC-20.
+- That WETH9 is unwrapped to native ETH from the WETH9 contract.
+- The attacker EOA realizes a net native balance gain of `133540501283062363385` wei after all gas and protocol fees; the remainder flows to Base system fee addresses.
 
-- BookManager enforces settlement of currency deltas to zero but trusts the ERC20s themselves.  
-- Rebalancer’s pool logic, including LP `mint()` and `burn()`, assumes that both tokens in a pair (here WETH9 and 0xd3c8…) are honest, externally priced assets.  
-- SimpleOracleStrategy configures order placement but does not add custody checks.  
-- Token `0xd3c8…` is fully attacker‑controlled and can mint balances at will, including to Rebalancer, within a single transaction and without external collateral.
+### Trace evidence of the mint/burn exploit
 
-## ACT Opportunity and Exploit Predicate
+The seed transaction trace for `0x8fcdfc...` shows the flash loan, Rebalancer/BookManager interactions, and the critical WETH9 transfer from Rebalancer to the strategy:
 
-### Pre‑state and block
+```text
+// Excerpt from trace.cast log for tx 0x8fcdfc...
+0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1::setup()
+  ...
+  0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb::flashLoan(WETH9, 267400000000000000000, ...)
+    WETH9::transfer(0x32Fb..., 267400000000000000000)
+    0x32Fb...::onMorphoFlashLoan(...)
+      Rebalancer::open(... WETH9/0xd3c8 books ..., 0x32Fb...)
+      ...
+      WETH9::transfer(0x32Fb..., 133700000000000000000)
+      ...
+```
 
-- **Block height B:** `23514451` on Base (chainid 8453).  
-- **Pre‑state `σ_B`:** The Base chain state immediately before block 23514451, including:
-  - Rebalancer `0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895`,  
-  - BookManager `0x382CCccbD3b142D7DA063bF68cd0c89634767F76`,  
-  - WETH9 `0x4200000000000000000000000000000000000006`,  
-  - Attacker contract `0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1`,  
-  - Attacker‑controlled token `0xd3c8d0cd07Ade92df2d88752D36b80498cA12788`, and  
-  - Strategy `0x9092e5f62b27c3ed78feb24a0f2ad6474d26dda5`,  
-  as they stood immediately before tx `0x8fcdfc…c04`.
+Caption: *Seed transaction trace for `0x8fcdfc...`, showing the Morpho WETH9 flash loan, Rebalancer `open` call tying a new pool to existing WETH9/`0xd3c8` books, and the `133.7` WETH9 transfer from Rebalancer to the strategy contract.*
 
-This pre‑state is supported by:
+This trace confirms:
+- The strategy takes a WETH9 flash loan of `267.4` WETH9.
+- It uses Rebalancer and BookManager to open a new pool keyed to existing WETH9/`0xd3c8` books.
+- After the mint/burn sequence, Rebalancer transfers exactly `133.7` WETH9 to the strategy contract, which is then unwrapped and forwarded as ETH to the attacker EOA.
 
-- Seed transaction metadata for the exploit tx.  
-- A prestateTracer state diff around the exploit tx.  
-- Historical txlists for the attacker EOA and attacker contract, confirming deployment, ownership, and prior interactions.
+### ACT exploit conditions
 
-### Transaction sequence starting from σ_B
-
-There is a single adversary‑crafted transaction in the relevant sequence:
-
-1. **Tx index 1 – exploit transaction**
-   - `chainid`: `8453`  
-   - `txhash`: `0x8fcdfc…c04`  
-   - `type`: `adversary-crafted`  
-   - **Inclusion feasibility:**  
-     Signed and sent by unprivileged EOA `0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025` with a standard gas price and no special permissions. Any adversary can:
-     - Deploy the same attacker contract,  
-     - Configure the same Rebalancer pool and strategy, and  
-     - Submit the same flash‑loan‑funded transaction starting from `σ_B`.
-   - **Notes:**  
-     A single‑tx flash‑loan exploit that:
-     - Borrows **267.4 WETH9** from Morpho,  
-     - Uses attacker‑controlled token `0xd3c8…` in a Clober Rebalancer WETH9/0xd3c8 pool to execute an `open/mint/rebalance/burn` sequence, and  
-     - Repays the flash loan and withdraws a net **133.7 WETH9** to the attacker EOA.
-
-### Exploit predicate: profit in ETH
-
-- **Type:** `profit`  
-- **Reference asset:** ETH  
-- **Adversary address (cluster representative):** `0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025`
-
-**Portfolio values (ETH‑equivalent, chainid 8453):**
-
-- `value_before_in_reference_asset = 1.153475443767715212` ETH  
-- `value_after_in_reference_asset  = 134.693976726830078597` ETH  
-- `fees_paid_in_reference_asset    = 0.159498624789241704` ETH (gas fees from tx receipt)  
-- `value_delta_in_reference_asset  = 133.540501283062363385` ETH (net profit after fees)
-
-**Valuation method:**
-
-- The cluster’s portfolio is computed by summing native ETH and WETH9‑backed balances.  
-- Pre/post native balances for `0x012F…6025` are taken from a balance‑diff artifact and the prestateTracer diff; the attacker contract `0x32Fb1B…97C1` has zero native balance both before and after.  
-- WETH9 `Transfer` logs for the exploit tx show:
-  - A net **+133.7 WETH9** to the adversary cluster, and  
-  - A matching **–133.7 WETH9** from WETH9’s underlying native backing.  
-- Gas usage and gas price from the tx receipt yield the fee amount above.
-
-The adversary’s ETH‑denominated portfolio value strictly increases by **133.540501283062363385 ETH**, and the cluster also gains additional 0xd3c8… units, so the profit predicate is satisfied.
-
-The **non‑monetary** oracle fields (`oracle_name`, `oracle_definition`, `oracle_evidence`) are intentionally empty, as no non‑monetary predicate is needed.
-
-## Vulnerability & Root Cause Analysis
-
-### Vulnerability brief
-
-The vulnerable pool is a Rebalancer WETH9/0xd3c8 pool in which:
-
-- The non‑WETH asset (`0xd3c8…`) is fully attacker‑controlled and can mint arbitrarily.  
-- Rebalancer’s mint/burn logic and BookManager’s currency‑delta tracking treat the resulting WETH9/0xd3c8 position as fully backed.  
-
-This allows a single flash‑loan transaction to withdraw **133.7 WETH9 more than contributed**, while leaving LP supply and 0xd3c8 balances intact, thereby breaking the expected conservation of WETH9 backing for LPs.
-
-### Root cause detail
-
-1. **Pool creation and trust boundary**
-   - Verified Rebalancer and BookManager code show that pools are created from token addresses and strategy parameters only.  
-   - There is no restriction requiring:
-     - Protocol ownership of either asset, or  
-     - Immutability / external price source guarantees.  
-   - As a result, the WETH9/0xd3c8 pool pairs WETH9 with a fully attacker‑controlled ERC20.
-
-2. **Attacker control over 0xd3c8…**
-   - Token `0xd3c8…` is controlled by attacker contract `0x32Fb1B…97C1` (confirmed by slot 0 storage).  
-   - Its balance mapping at slot 1 records balances for addresses including Rebalancer and the attacker contract.  
-   - PrestateTracer state diff for the exploit tx shows that:
-     - The balance entry for Rebalancer `0x6A0b87…F3895` at slot 1 increases from `0` to `2.674e20` (i.e., 267.4 units).  
-     - The balance entry for the attacker contract `0x32Fb1B…97C1` increases from `1.0e22` to `1.01337e22` (i.e., an additional 133.7 units).  
-   - These increases occur within the exploit tx and are not backed by any ETH inflow, demonstrating arbitrary in‑tx minting to both the pool and the attacker.
-
-3. **WETH9 inflow/outflow mismatch**
-   - WETH9 `Transfer` logs and the debug trace of the exploit tx show that:
-     - The attacker borrows **267.4 WETH9** from Morpho.  
-     - The attacker sends **267.4 WETH9** into Rebalancer as part of the mint/rebalance/burn sequence.  
-     - Rebalancer sends **401.1 WETH9** out to the attacker (equal to 267.4 + 133.7).  
-     - The attacker repays **267.4 WETH9** to Morpho and finally unwraps WETH9 to native ETH into the EOA.
-
-   _Origin: Debug call trace for exploit tx `0x8fcdfc…c04` (Base)._
-
-   ```json
-   {
-     "jsonrpc": "2.0",
-     "id": 1,
-     "result": {
-       "calls": [
-         {
-           "from": "0x32fb1bedd95bf78ca2c6943ae5aeaeaafc0d97c1",
-           "to": "0x4200000000000000000000000000000000000006",
-           "type": "STATICCALL",
-           "input": "0x70a08231…",   // WETH9.balanceOf(Rebalancer)
-           "output": "…"
-         },
-         {
-           "from": "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb",
-           "to": "0x4200000000000000000000000000000000000006",
-           "type": "CALL",
-           "input": "0xa9059cbb…",   // Morpho -> attacker (267.4 WETH9)
-           "logs": [
-             {
-               "address": "0x4200000000000000000000000000000000000006",
-               "topics": ["Transfer", "…Morpho", "…attacker"]
-             }
-           ]
-         },
-         {
-           "calls": [
-             {
-               "from": "0x6a0b87d6b74f7d5c92722f6a11714dbeda9f3895",
-               "to": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-               "type": "CALL",
-               "input": "0xa9059cbb…", // Rebalancer -> attacker, WETH9.transfer
-               "logs": [ "Transfer 401.1 WETH9 to attacker cluster" ]
-             }
-           ]
-         }
-       ]
-     }
-   }
-   ```
-
-   Combined with the state diff for WETH9’s underlying native balance, this establishes a **net 133.7 WETH9 loss** from WETH9’s backing and a matching gain for the adversary.
-
-4. **BookManager currency delta settlement**
-   - BookManager’s design requires that, over a `lock()`/`settle()` cycle, currency deltas for each currency are brought back to zero.  
-   - The exploit tx completes without reverting at the BookManager level, confirming that all currency deltas—including for WETH9 and 0xd3c8…—are internally consistent according to its accounting rules.
-   - Therefore, the only consistent interpretation is that Rebalancer’s internal pool representation and LP accounting allow attacker‑controlled 0xd3c8… balances to stand in for genuine value on one side of the pair, enabling an honest‑looking settlement of deltas while WETH9 reserves are actually under‑collateralized.
-
-5. **Broken invariant as seen by victims**
-   - After the exploit, LP holder `0x919dF0eD50391F58D50A69fA68e2F5dC5907d1ce` attempts to call Rebalancer `burn()` for this WETH9/0xd3c8 pool.
-   - In both victim txs (`0x2d91df5b…bafb` and `0x7cc6b347…905f`), the call trace shows:
-     - Rebalancer unwinding orders via BookManager, and  
-     - A subsequent call to WETH9 `transfer(0x919dF0eD…, amount)` that **reverts** with `"ERC20: transfer amount exceeds balance"`.
-
-   _Origin: Debug call trace for victim burn tx `0x2d91df5b…bafb`._
-
-   ```json
-   {
-     "jsonrpc": "2.0",
-     "id": 1,
-     "result": {
-       "calls": [
-         {
-           "from": "0x6a0b87d6b74f7d5c92722f6a11714dbeda9f3895",
-           "to": "0x4200000000000000000000000000000000000006",
-           "type": "CALL",
-           "input": "0xa9059cbb…",  // WETH9.transfer(0x919dF0eD…, amount)
-           "error": "execution reverted"
-         }
-       ]
-     }
-   }
-   ```
-
-   This proves that the invariants “LP `burn()` is fully collateralized by pool WETH9 reserves” and “BookManager currency deltas plus internal reserves cover LP redemptions” are **violated** as a direct consequence of the exploit sequence.
-
-### Vulnerable components
-
-- **Rebalancer (`0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895`)**  
-  Functions `open()`, `mint()`, `_burn()`, `_settleCurrency()`, and the LP accounting for the WETH9/0xd3c8 pool key `0xc8cbe608c82ee9c4c30f01d7c0eefd977538ac396ed34430aa3993bfe0d363ae` are involved.
-
-- **BookManager (`0x382CCccbD3b142D7DA063bF68cd0c89634767F76`)**  
-  Currency delta tracking and `settle()`/`withdraw()` integration with Rebalancer for WETH9 and 0xd3c8 in book IDs `0x87a120` and `0x87a184`.
-
-- **SimpleOracleStrategy (`0x9092…dda5`)**  
-  Strategy configuration for this WETH9/0xd3c8 pool, relying on token decimals and oracle prices while implicitly assuming that 0xd3c8 behaves like a standard asset.
-
-- **Attacker‑controlled ERC20 (`0xd3c8d0cd07Ade92df2d88752D36b80498cA12788`)**  
-  Used as the non‑WETH side of the pool despite being fully controlled by the adversary contract.
-
-### Exploit preconditions
-
-The exploit requires that:
-
-1. A Rebalancer pool is created for WETH9 (`0x4200…0006`) paired with attacker‑controlled ERC20 `0xd3c8…` **without any whitelist or provenance checks** on the non‑WETH token.  
-2. The attacker can deploy and control token `0xd3c8…` such that its slot‑1 balance mapping for Rebalancer and the attacker can be increased within a single transaction, **without any ETH or trusted collateral inflow**.  
-3. The WETH9/0xd3c8 pool is configured with SimpleOracleStrategy and BookManager such that LP `mint()`/`burn()` mechanics rely on internal reserves plus orderbook liquidity but do **not** enforce a strict conservation constraint binding WETH9 reserves to attacker‑controlled 0xd3c8 balances.  
-4. A flash‑loan provider (Morpho `0xBBBB…FCb`) is available to lend the WETH9 principal needed so the exploit can be conducted atomically and repaid within the same transaction.
-
-### Security principles violated
-
-- **Trust boundary between protocol‑owned and attacker‑controlled tokens**  
-  The system treats 0xd3c8… as a normal reserve asset, despite it being mintable by the adversary.
-
-- **Conservation of WETH9 value in the pool**  
-  LP `burn()` is expected to be fully collateralized by WETH9 reserves. After the exploit, the pool becomes under‑collateralized by exactly 133.7 WETH9.
-
-- **Assumption of honest ERC20 behavior in strategies**  
-  Strategies and LP accounting assume that any ERC20 paired with WETH9 behaves like a standard, externally priced asset, rather than being fully attacker‑controlled.
+The ACT exploit conditions derived from the above evidence are:
+- There exists a positive WETH9 value accumulated under Rebalancer’s locker address for the relevant WETH9/`0xd3c8` books at pre-state sigma_B (captured in the `133.7` WETH9 that can be withdrawn without new capital risk to the attacker).
+- An unprivileged adversary can deploy an arbitrary strategy contract and register a new Rebalancer pool key that references existing WETH9/`0xd3c8` books while sharing the same locker address.
+- Morpho flash-loan liquidity for `267.4` WETH9 is available, allowing the adversary to supply temporary notional collateral without upfront capital.
+- The protocol does not impose per-pool accounting isolation for locker currency deltas, so burns from the attacker-controlled pool settle against aggregated locker-wide WETH9 deltas.
 
 ## Adversary Flow Analysis
 
-### Adversary‑related accounts
+### Strategy summary
 
-**Adversary cluster**
+The adversary uses a single-block, two-transaction strategy:
+- In transaction `0x4fe2383c6dc0f03e53ea5ad4dd3b87c058c960234e57855fb49a9935a810a290`, EOA `0x012F...` deploys the strategy contract `0x32Fb...`.
+- In transaction `0x8fcdfc...`, the same EOA calls `0x32Fb...::setup()`, which:
+  - Takes a WETH9 flash loan from Morpho.
+  - Interacts with Rebalancer and BookManager to mint and burn positions tied to existing WETH9/`0xd3c8` books.
+  - Exploits locker-wide accounting to withdraw `133.7` WETH9.
+  - Unwraps WETH9 to ETH and forwards `133.7` ETH to the EOA.
 
-1. **EOA `0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025` (Base, 8453)**  
-   - `is_eoa = true`, `is_contract = false`  
-   - Sender of:
-     - The deployment tx `0x4fe2383c…0290` for the attacker contract, and  
-     - The exploit tx `0x8fcdfc…c04`.  
-   - Receives the final **133.7 ETH‑equivalent** withdrawn from WETH9 after unwrapping.
+### Adversary-related accounts
 
-2. **Attacker contract `0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1` (Base, 8453)**  
-   - `is_eoa = false`, `is_contract = true`  
-   - Deployed by `0x012F…6025` and used as:
-     - Receiver of the Morpho flash loan, and  
-     - Caller into Rebalancer.  
-   - Owns token `0xd3c8…` via slot‑0 storage and orchestrates the `open/mint/rebalance/burn` sequence.
+- **Adversary cluster**
+  - `0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025` (EOA, Base 8453)  
+    - Sender of both attacker-crafted transactions `0x4fe2383c6d...` and `0x8fcdfc...`.  
+    - Receives `133.7` ETH unwrapped from WETH9 in the seed tx.  
+    - Initiates subsequent large transfers of `132` ETH-equivalent ERC-20 and `132` native ETH, as shown in:
+      - `artifacts/root_cause/data_collector/iter_6/address/8453/0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025_normal_txs_0x1660000-0x1675000.json`
+      - `artifacts/root_cause/data_collector/iter_6/address/8453/0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025_erc20_txs_0x1660000-0x1675000.json`
+  - `0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1` (strategy contract, Base 8453)  
+    - Deployed by `0x012F...` in tx `0x4fe2383c6d...`.  
+    - Immediately used in seed tx `0x8fcdfc...` to orchestrate the Morpho flash loan and Rebalancer/BookManager calls.  
+    - Its normal tx history shows it is created and used solely by the attacker EOA around the incident.
 
-3. **Attacker‑controlled ERC20 `0xd3c8d0cd07Ade92df2d88752D36b80498cA12788` (Base, 8453)**  
-   - `is_eoa = false`, `is_contract = true`  
-   - Slot‑0 owner is `0x32Fb1B…97C1`.  
-   - Slot‑1 balance mapping mints:
-     - **267.4 tokens to Rebalancer**, and  
-     - **133.7 tokens to the attacker contract**,  
-     during the exploit tx, with no ETH inflow.
-
-**Victim and protocol components**
-
-1. **Clober Rebalancer** – `0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895` (Base, 8453), verified.  
-2. **Clober BookManager** – `0x382CCccbD3b142D7DA063bF68cd0c89634767F76` (Base, 8453), verified.  
-3. **SimpleOracleStrategy** – `0x9092e5f62b27c3ed78feb24a0f2ad6474d26dda5` (Base, 8453), verified.  
-4. **WETH9** – `0x4200000000000000000000000000000000000006` (Base, 8453), verified.  
-5. **Victim LP holder** – `0x919dF0eD50391F58D50A69fA68e2F5dC5907d1ce` (Base, 8453), `is_verified = unknown`, but clearly observed as the LP attempting burn() calls that revert.
+- **Victim candidates**
+  - **Rebalancer locker** – `0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895` (verified).  
+    - Holds pooled WETH9 and `0xd3c8...` from historical LPs and traders.  
+    - Its WETH9 balance decreases by exactly `133.7` WETH9 in the exploit block.
+  - **BookManager** – `0x382CCccbD3b142D7DA063bF68cd0c89634767F76` (verified).  
+    - Maintains per-book state and currency deltas, but exposes those deltas at the locker level, enabling the cross-pool leak.
 
 ### Lifecycle stages
 
-#### 1. Adversary contract deployment and token control
+1. **Adversary contract deployment**
+   - Tx: `0x4fe2383c6dc0f03e53ea5ad4dd3b87c058c960234e57855fb49a9935a810a290` (block `23514451`, Base 8453).  
+   - EOA `0x012F...` deploys strategy contract `0x32Fb...` with zero value, preparing a helper contract to interact with Morpho, Rebalancer, BookManager, and WETH9.
+   - Evidence:  
+     `artifacts/root_cause/data_collector/iter_1/address/8453/0x32Fb1BedD95BF78ca2c6943aE5AEaEAAFc0d97C1_normal_txs.json`.
 
-- **Tx:** `0x4fe2383c6dc0f03e53ea5ad4dd3b87c058c960234e57855fb49a9935a810a290` (Base, 8453, block 23514451)  
-- **Mechanism:** other  
+2. **Flash-loan-backed Rebalancer exploit**
+   - Tx: `0x8fcdfc...` (block `23514451`, Base 8453).  
+   - The strategy contract `0x32Fb...`:
+     - Borrows `267.4` WETH9 via Morpho flash loan.  
+     - Uses Rebalancer and BookManager to open a pool key tied to existing WETH9/`0xd3c8` books, mint LP, and then burn it.  
+     - During burn, Rebalancer’s `_settleCurrency` pulls the locker-wide WETH9 currency delta into the pool’s reserves and pays it out via `withdrawalA/withdrawalB`, resulting in a `133.7` WETH9 transfer from Rebalancer to `0x32Fb...`.  
+     - Repays the flash-loan principal and unwraps the remaining `133.7` WETH9 to ETH, sending `133.7` ETH to EOA `0x012F...`.
+   - Evidence:
+     - Seed trace: `artifacts/root_cause/seed/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/trace.cast.log`.
+     - Rebalancer and BookManager sources under  
+       `artifacts/root_cause/data_collector/iter_1/contract/8453/`.
+     - ERC-20 and native balance diffs:
+       - `artifacts/root_cause/data_collector/iter_5/tx/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/balance_diff_prestate.json`
+       - `artifacts/root_cause/data_collector/iter_6/tx/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/erc20_balance_diff_pre_0x166cd52_post_0x166cd53.json`
 
-Effect:
-
-- EOA `0x012F…6025` deploys attacker contract `0x32Fb1B…97C1`.  
-- Later storage of token `0xd3c8…` shows `0x32Fb1B…97C1` as slot‑0 owner/admin.  
-- This establishes that the adversary controls both:
-  - The execution contract that will call Rebalancer, and  
-  - The ERC20 used as the pool’s non‑WETH asset.
-
-Evidence used:
-
-- Txlist for `0x012F…6025`, including the attacker‑contract deployment tx.  
-- Storage read of token `0xd3c8…` slot 0 confirming owner `0x32Fb1B…97C1`.
-
-#### 2. Exploit execution via flash‑loan mint/rebalance/burn
-
-- **Tx:** `0x8fcdfc…c04` (Base, 8453, block 23514451)  
-- **Mechanism:** `flashloan`  
-
-Effect (per debug trace, state diff, and Rebalancer code):
-
-1. The attacker contract obtains a **267.4 WETH9** flash loan from Morpho (`0xBBBB…FCb`).  
-2. Using `open()` and `mint()` on Rebalancer, it creates and mints into a WETH9/0xd3c8 pool governed by SimpleOracleStrategy.  
-3. Within this sequence, token `0xd3c8…`:
-   - Mints **267.4 units** to Rebalancer, and  
-   - Mints **133.7 units** to the attacker contract,  
-   at no ETH cost, as proven by the state diff and slot‑1 mapping layout.  
-4. The attacker immediately calls `burn()` on the Rebalancer LP. BookManager and Rebalancer treat the 0xd3c8 balances as real value and clear book positions accordingly.  
-5. Rebalancer sends **401.1 WETH9** to the attacker (267.4 + 133.7), while it only received 267.4 WETH9 from the attacker earlier in the tx.  
-6. The attacker repays **267.4 WETH9** to Morpho and unwraps the remaining 133.7 WETH9 to ETH, sending it to EOA `0x012F…6025`.
-
-Evidence used:
-
-- **Debug_callTracer trace** for `0x8fcdfc…c04`, showing:
-  - Flash loan from Morpho,  
-  - WETH9 transfers into and out of Rebalancer, and  
-  - Unwrap of WETH9 to native ETH.  
-- **PrestateTracer state diff** for the same tx, showing:
-  - 0xd3c8 balance mapping entries for Rebalancer and attacker increasing by 267.4 and 133.7 respectively, and  
-  - WETH9’s underlying balance decreasing by 133.7e18 wei.  
-- **Rebalancer.sol** (verified) for `0x6A0b87…F3895`, confirming that the observed call sequence aligns with `open()`, `mint()`, and `burn()` flows and that it relies on BookManager’s currency deltas without additional trust checks on 0xd3c8….
-
-#### 3. Victim LP burn failures
-
-- **Tx 1:** `0x2d91df5bc6d8f7733331aad5fc986dbf3d6c42948ae135e7205b8714efcbbafb` (Base, 8453, block 23514825)  
-- **Tx 2:** `0x7cc6b3475f2ed221110e232a53819a989e2cc27c3a66d7a4e74b854b2754905f` (Base, 8453, block 23514835)  
-- **Mechanism:** `other`  
-
-Effect:
-
-- LP holder `0x919dF0eD…` attempts to burn Rebalancer LP for the **same WETH9/0xd3c8 pool key** used in the exploit.  
-- In both transactions, the call trace shows that:
-  - Rebalancer unwinds orders through BookManager, and  
-  - Then calls `WETH9.transfer(0x919dF0eD…, amount)`.  
-- WETH9 **reverts** with `"ERC20: transfer amount exceeds balance"`, indicating that the WETH9 reserves at the Rebalancer/BookManager side are insufficient to cover the LP’s claim.
-
-Evidence used:
-
-- Debug_callTracer traces for both victim txs, each showing the final WETH9 `transfer` call reverting with `ERC20: transfer amount exceeds balance`.  
-- Correlation with the prior exploit tx’s WETH9 and 0xd3c8 state changes, confirming that the under‑collateralization arises directly from the earlier flash‑loan attack.
-
-These stages together describe an end‑to‑end adversary flow: contract deployment and control, the exploit execution, and the observable impact on honest LPs.
+3. **Post-exploit profit distribution**
+   - After the exploit block, EOA `0x012F...` distributes a large portion of the gained ETH:
+     - Tx `0x0f4dac09163b8b39d77f851d36ea3df6e7173d78c566d37d8083f0b20693ab40` (block `23514579`, Base 8453): sends `132` ETH to `0x514786c268f7080573687f240da9bd37d574aae3`.
+     - Tx `0x158e47edaaceb71da8731cced81c302e356fa2f6855155ff602a73c2e76154f3` (block `23515032`, Base 8453): sends `132` ERC-20 ETH-equivalent tokens (e.g., `ETH..`) to `0x51473f469fd3b9e3d7eff30b57e9f210e23faae3`.
+   - These transfers are not required for the ACT success predicate but illustrate subsequent profit movement away from the original EOA while keeping control within the adversary cluster.
 
 ## Impact & Losses
 
-### Quantified losses
+- **Total loss overview**
+  - `133.7` WETH9 drained from the Rebalancer locker.
+  - `133.540501283062363385` ETH (native) realized as net profit to the adversary EOA `0x012F...` after accounting for gas and protocol fees.
 
-- **Token:** WETH (WETH9 on Base, `0x4200…0006`)  
-- **Amount:** `133.7` WETH
-
-### Impact summary
-
-- The WETH9/0xd3c8 Rebalancer pool loses **133.7 WETH9** of backing relative to its LP supply.  
-- This is evidenced by:
-  - WETH9 `Transfer` logs in the exploit tx,  
-  - Native balance diffs for WETH9 (and the adversary EOA), and  
-  - Subsequent WETH9 `transfer` reverts in victim LP `burn()` attempts.
-- At least one LP address, `0x919dF0eD50391F58D50A69fA68e2F5dC5907d1ce`, is unable to redeem WETH9 from this pool.  
-- Other Clober pools and system components do **not** show observable impact in the traces and artifacts reviewed.
+- **Economic impact**
+  - ERC-20 and native balance diffs show that in the exploit block:
+    - The Rebalancer locker’s WETH9 balance decreases by exactly `133.7` WETH9.
+    - The attacker EOA’s native balance increases by `133540501283062363385` wei after all fees.
+    - The remaining `0.159498716937636615` ETH-equivalent from the `133.7` WETH9 unwound value goes to Base system fee addresses.
+  - The economic loss is borne by the aggregated set of LPs and traders whose historical WETH9 P/L had been accumulated in Rebalancer’s locker for the affected WETH9/`0xd3c8` books.  
+  - The available on-chain artifacts do not allow decomposition of the `133.7` WETH9 loss across specific LP/trader addresses; only the aggregate loss is observable.
 
 ## References
 
-Key supporting artifacts used in this analysis include:
+1. **Seed exploit trace for tx `0x8fcdfc...`**  
+   `artifacts/root_cause/seed/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/trace.cast.log`
 
-1. **[1] Exploit tx debug trace and state diff (`0x8fcdfc…c04`)**  
-   - A debug_callTracer execution trace and a prestateTracer state diff for the exploit transaction on Base (8453).  
-   - Used to reconstruct:
-     - The flash‑loan flow through Morpho,  
-     - WETH9 transfers into and out of Rebalancer,  
-     - 0xd3c8 balance mapping updates for Rebalancer and the attacker, and  
-     - Net WETH9 and native balance changes.
+2. **Rebalancer.sol source code** (`0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895`, chainid 8453)  
+   `artifacts/root_cause/data_collector/iter_1/contract/8453/0x6A0b87D6b74F7D5C92722F6a11714DBeDa9F3895/source/src/src/Rebalancer.sol`
 
-2. **[2] Rebalancer.sol and BookManager.sol verified source**  
-   - Verified source code for Rebalancer `0x6A0b87…F3895` and BookManager `0x382C…6776` on Base.  
-   - Used to confirm:
-     - How pools are keyed and opened,  
-     - How LP mint/burn interacts with BookManager and currency deltas, and  
-     - That no trust boundary exists preventing an attacker‑controlled ERC20 from being used as the non‑WETH side of a pool.
+3. **BookManager.sol source code** (`0x382CCccbD3b142D7DA063bF68cd0c89634767F76`, chainid 8453)  
+   `artifacts/root_cause/data_collector/iter_1/contract/8453/0x382CCccbD3b142D7DA063bF68cd0c89634767F76/source/src/BookManager.sol`
 
-3. **[3] 0xd3c8… token storage and owner control**  
-   - Storage reads for token `0xd3c8d0c…2788`, including slot 0 (owner/admin) and slot‑1 balance mapping entries.  
-   - Used to establish attacker control over the token and to quantify the minted balances (267.4 to Rebalancer and 133.7 to the attacker) during the exploit tx.
+4. **Prestate native balance diff for exploit tx `0x8fcdfc...`**  
+   `artifacts/root_cause/data_collector/iter_5/tx/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/balance_diff_prestate.json`
 
-## All Relevant Transactions (Summary)
+5. **WETH9 ERC-20 balance diff across pre/post blocks `0x166cd52` / `0x166cd53`**  
+   `artifacts/root_cause/data_collector/iter_6/tx/8453/0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04/erc20_balance_diff_pre_0x166cd52_post_0x166cd53.json`
 
-The analysis considers the following on‑chain transactions on Base (chainid 8453):
+6. **BookManager sigma_B P/L view at pre-block `0x166cd52`**  
+   `artifacts/root_cause/data_collector/iter_6/address/8453/0x382CCccbD3b142D7DA063bF68cd0c89634767F76_books_sigma_B_PL_view_pre_0x166cd52.json`
 
-1. `0x4fe2383c6dc0f03e53ea5ad4dd3b87c058c960234e57855fb49a9935a810a290` – **related**  
-   - Attacker contract deployment by EOA `0x012F…6025`.
-
-2. `0x8fcdfcded45100437ff94801090355f2f689941dca75de9a702e01670f361c04` – **adversary-crafted**  
-   - Single‑tx flash‑loan exploit draining 133.7 WETH9 from the WETH9/0xd3c8 Rebalancer pool.
-
-3. `0x2d91df5bc6d8f7733331aad5fc986dbf3d6c42948ae135e7205b8714efcbbafb` – **victim-observed**  
-   - Post‑incident LP `burn()` attempt by `0x919dF0eD…` that reverts in WETH9 `transfer`.
-
-4. `0x7cc6b3475f2ed221110e232a53819a989e2cc27c3a66d7a4e74b854b2754905f` – **victim-observed**  
-   - Subsequent LP `burn()` attempt by the same LP address, also reverting in WETH9 `transfer`.
-
-Together, these transactions and the associated code and storage evidence fully support the root cause conclusion: **the protocol’s LP accounting and currency‑delta model permit an attacker‑controlled ERC20 to be used as a trusted reserve asset, enabling a flash‑loan‑funded mint/burn sequence that drains 133.7 WETH9 and leaves honest LPs insolvent.**
+7. **Attacker EOA normal transactions and ERC-20 transfers around exploit block**  
+   - `artifacts/root_cause/data_collector/iter_6/address/8453/0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025_normal_txs_0x1660000-0x1675000.json`  
+   - `artifacts/root_cause/data_collector/iter_6/address/8453/0x012Fc6377F1c5CCF6e29967Bce52e3629AaA6025_erc20_txs_0x1660000-0x1675000.json`
 

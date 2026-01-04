@@ -1,0 +1,4 @@
+[DeFiHackLabs_2025-11_BalancerV2]
+- txhashes (tx, chainid):
+  - 0x6ed07db1a9fe5c0794d44cd36081d6a6df103fab868cdd75d581e3bd23bc9742, 1
+  - 0xd155207261712c35fa3d472ed1e51bfcd816e616dd4f517fa5959836f5b48569, 1
