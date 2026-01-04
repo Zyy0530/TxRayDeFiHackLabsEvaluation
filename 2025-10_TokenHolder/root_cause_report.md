@@ -1,282 +1,366 @@
+# BNB Chain WBNB PrivilegedLoan Drain via BorrowerOperationsV6::sell
+
 ## 1. Incident Overview TL;DR
 
-On BSC (chainid 56), EOA `0x3fee6d8aaea76d06cf1ebeaf6b186af215f14088` deployed and configured an owner-only router/holder contract `0xe82Fc275B0e3573115eaDCa465f85c4F96A6c631` that integrates with a BorrowerOperationsV6 / TokenHolder stack and WBNB (`0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`).  
-Across a four-transaction sequence (deploy, configure, leveraged operation, withdraw), this owner-controlled stack generated a net gain of **19.2 WBNB** for the owner EOA while paying only gas in native BNB.  
-Selector-level analysis and traces show that all critical entrypoints on `0xe82F...` are strictly owner-gated with storage-configured router, token, and beneficiary addresses, so **no anyone-can-take (ACT) opportunity exists**: an unprivileged adversary cannot reproduce this flow.  
-No protocol or user losses occurred; the observed behavior is consistent with an owner-operated leveraged router and fee routing design rather than an exploit of a vulnerable victim.
+On BNB Chain (chainid 56), an unprivileged adversary-controlled EOA `0x3fee6d8aaea76d06cf1ebeaf6b186af215f14088` used a custom helper contract `0xe82fc275b0e3573115eadca465f85c4f96a6c631` to invoke `BorrowerOperationsV6::sell` through collateral-holder proxy `0x2eed3dc9c5134c056825b12388ee9be04e522173`. Due to a design flaw in how `BorrowerOperationsV6` integrates with `TokenHolder::privilegedLoan` behind token-holder proxy `0x616b36265759517af14300ba1dd20762241a3828`, the call transferred 20 WBNB of protocol collateral from `0x2eed...` to arbitrary recipients even though the referenced loan (`loanId = 0`) was not active. In the core exploit transaction `0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6` at block `63856735`, 0.8 WBNB was sent to external EOA `0x8432cd30c4d72ee793399e274c482223dca2bf9e` and 19.2 WBNB to attacker-controlled contract `0xe82f...`, with no WBNB returned to the collateral-holder. Including deployment, configuration, exploit, and withdrawal transactions, the attacker paid 0.1247948 BNB in gas, yielding at least 19.0752052 WBNB of net profit from a permissionless ACT opportunity.
 
 ## 2. Key Background
 
-The incident centers on a custom leveraged router and TokenHolder stack on BSC:
+The affected system is a BorrowerOperationsV6-based protocol that manages collateralized positions and integrates with a separate TokenHolder component for collateral handling. On BNB Chain:
 
-- **Router/holder contract**: `0xe82Fc275B0e3573115eaDCa465f85c4F96A6c631` (unverified runtime, analyzed via disassembly and selector analysis).  
-- **Leveraged router**: `0x616B36265759517AF14300Ba1dD20762241a3828`.  
-- **BorrowerOperationsV6 / TokenHolder contracts**:  
-  - `0x8c7f34436C0037742AeCf047e06fD4B27Ad01117`  
-  - `0x2EeD3DC9c5134C056825b12388Ee9Be04E522173`  
-  - `0x3403f2Ba8aA448c208c2d1a41F2089c5a6f924e4`  
-- **Fee address**: `0x8432CD30C4d72Ee793399E274C482223DCA2bF9e`.  
-- **Reference asset**: WBNB (`0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`), whose verified implementation is a standard wrapped-BNB ERC‑20 with 1:1 redeemability.
+- The collateral-holder is deployed as proxy `0x2eed3dc9c5134c056825b12388ee9be04e522173` and delegates to a `BorrowerOperationsV6` implementation.
+- A token-holder proxy `0x616b36265759517af14300ba1dd20762241a3828` delegates to a TokenHolder implementation (implementation address `0x8c7f34436c0037742aecf047e06fd4b27ad01117`) that exposes `privilegedLoan` and related WBNB transfer logic.
+- The collateral token is WBNB at address `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`, implemented as a standard wrapping contract where each 1 WBNB represents 1 BNB deposited on-chain.
 
-The relevant pre-state `σ_B` is BSC at block **63856623**, where:
+Immediately before block `63856735` (pre-state `σ_B`), the protocol state relevant to the incident is reconstructed from:
 
-- The BorrowerOperationsV6 / TokenHolder / fee contracts are already deployed and funded per protocol design.  
-- The owner EOA `0x3fee6...` holds **0 WBNB**.  
-- Router/holder `0xe82F...` is **not yet deployed**.
+- Seed metadata for the exploit transaction at `artifacts/root_cause/seed/56/0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6/metadata.json`.
+- A prestate tracer for the exploit transaction at `artifacts/root_cause/data_collector/iter_2/tx/56/0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6/trace.prestate_tracer.json`.
+- WBNB contract storage and code at `artifacts/root_cause/seed/56/0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c/src/Contract.sol`.
 
-From this pre-state, the owner executes:
-
-1. A contract deployment tx creating `0xe82F...` and storing the owner and WBNB addresses in storage.  
-2. A configuration tx that writes the leveraged router address into `0xe82F...`’s storage and sets routing parameters.  
-3. A leveraged operation (seed tx) that pulls 20 WBNB from TokenHolder, pays 0.8 WBNB in fees, and leaves 19.2 WBNB on `0xe82F...`.  
-4. A withdrawal tx that transfers the 19.2 WBNB from `0xe82F...` to the owner EOA.
+The root cause category for this incident is a protocol bug: a flawed interaction between BorrowerOperationsV6 and TokenHolder that allows misuse of `TokenHolder::privilegedLoan` to drain collateral-holder WBNB without any active loan or enforced repayment.
 
 ## 3. Vulnerability Analysis
 
-The key question is whether the observed profit arises from a **permissionless vulnerability** (an ACT opportunity) or from **intended, owner-controlled behavior**.
+### 3.1 Vulnerable Components
 
-Evidence from on-chain traces, selector-level reverse engineering, and contract source confirms:
+The core vulnerability resides in how BorrowerOperationsV6 and TokenHolder are wired:
 
-- `0xe82F...` enforces an **owner-only guard** on both the leveraged entrypoint (`0xe4c61b84`) and the withdrawal function `withdrawERC20(address)` (`0xf4f3b200`).  
-- The leveraged entrypoint does **not** forward `msg.sender` as a beneficiary; instead, it loads router, token, and beneficiary addresses from **fixed storage slots** written during deploy/config txs.  
-- The withdrawal function similarly loads the token and recipient from storage and sweeps the entire contract token balance to that recipient, again guarded by the owner-only check.
+- **Collateral-holder proxy (`0x2eed3dc9c5134c056825b12388ee9be04e522173`) and BorrowerOperationsV6 implementation**  
+  This proxy delegates calls to a BorrowerOperationsV6 implementation that includes a `sell` function. For `loanId = 0`, the implementation reads the loan record via `loans(0)` and obtains a struct where `active` is `false` and exposure-related fields are zero. Despite this, the implementation continues into the TokenHolder flow and triggers `TokenHolder::privilegedLoan`.
 
-Selector analysis for `0xe4c61b84` and `0xf4f3b200` (from `artifacts/root_cause/data_collector/iter_3/contract/56/0xe82fc275b0e3573115eadca465f85c4f96a6c631/selector_analysis_e4c61b84_f4f3b200.json`) shows:
+- **TokenHolder proxy (`0x616b36265759517af14300ba1dd20762241a3828`) and implementation (`0x8c7f34436c0037742aecf047e06fd4b27ad01117`)**  
+  The TokenHolder implementation exposes `privilegedLoan` and WBNB transfer logic. When invoked in this context, it:
+  - Reads WBNB balance for the collateral-holder at `0x2eed...`.
+  - Transfers 20 WBNB from `0x2eed...` to the token-holder proxy `0x616b...`.
+  - Permits additional WBNB transfers from `0x616b...` to arbitrary recipients, including external EOAs and attacker-controlled contracts, without enforcing that the loan is active or that a repayment to `0x2eed...` occurs.
+
+The combination of these components creates a privileged collateral-transfer path that can be invoked under conditions where no legitimate loan-based collateral movement should be allowed.
+
+### 3.2 Security Principles Violated
+
+The incident violates several key security properties:
+
+- **Access control:** The `TokenHolder::privilegedLoan` path, which is capable of moving collateral-holder WBNB, is reachable from an unprivileged external contract via BorrowerOperationsV6::sell. There is no restriction that limits calls to protocol-owned components or enforces that only legitimate protocol flows can invoke this function.
+- **Collateral accounting and invariants:** Collateral-holder `0x2eed...` loses 20 WBNB of collateral associated with `loans(0)` even though the loan is not active and without any corresponding reduction in user liabilities or protocol exposure records. This breaks expected collateralization and accounting invariants.
+- **Separation of concerns:** Profit-calculation and collateral-transfer logic are routed through a shared `TokenHolder::privilegedLoan` entry point without strict preconditions on loan state. This allows external contracts to repurpose internal flows—intended for controlled protocol operations—into direct value-extraction paths.
+
+### 3.3 Exploit Preconditions
+
+The ACT opportunity is permissionless and relies only on public chain state and standard transactions. The necessary conditions are:
+
+- An unprivileged EOA can deploy an arbitrary helper contract (here `0xe82f...`) and configure it with token-holder proxy `0x616b...` via a public function (selector `0x57964aaf`).
+- BorrowerOperationsV6::sell accepts parameters supplied via the helper contract such that:
+  - The function routes into TokenHolder::privilegedLoan for the WBNB collateral associated with `loanId = 0`, where the loan record is not active.
+  - The function uses the collateral-holder’s WBNB balance at `0x2eed...` as the source of funds for the privileged loan.
+- TokenHolder::privilegedLoan lacks a guard that enforces repayment of the 20 WBNB back to the collateral-holder proxy `0x2eed...` and permits arbitrary WBNB recipients, including the attacker-controlled contract `0xe82f...` and the external EOA `0x8432...`.
+
+Under these conditions, any unprivileged adversary can reproduce the exploit using only standard EOA transactions.
+
+## 4. Detailed Root Cause Analysis
+
+### 4.1 Seed Transaction and Pre-State
+
+The seed transaction for the incident is:
+
+- **Chain:** BNB Chain (chainid 56)  
+- **Tx hash:** `0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6`  
+- **From:** EOA `0x3fee6d8aaea76d06cf1ebeaf6b186af215f14088`  
+- **To:** Attacker helper contract `0xe82fc275b0e3573115eadca465f85c4f96a6c631`  
+- **Value:** 0 BNB  
+
+Seed metadata confirms the calldata and sender:
 
 ```json
 {
-  "functions": {
-    "0xe4c61b84": {
-      "summary": "Dispatcher ... enforces msg.sender == owner stored in storage slot 0 ... then invokes external router via selector 0xd54c73bf (sell(uint256,bytes,address,address,address,address))",
-      "access_control": "Owner-only: CALLER is compared against an address extracted from storage slot 0; non-owners revert ..."
-    },
-    "0xf4f3b200": {
-      "known_signatures": ["withdrawERC20(address)"],
-      "summary": "Enforces msg.sender == owner, loads token from storage (slot 3), calls ERC20.balanceOf(address(this)), then ERC20.transfer to a beneficiary loaded from storage",
-      "access_control": "Owner-only ... non-owners revert.",
-      "token_transfer_logic": [
-        "Loads token from storage and calls ERC20.balanceOf(address(this))",
-        "Builds ERC20.transfer calldata with a recipient read from storage and transfers the full balance out"
-      ]
+  "chainid": 56,
+  "txhash": "0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6",
+  "etherscan": {
+    "tx": {
+      "result": {
+        "from": "0x3fee6d8aaea76d06cf1ebeaf6b186af215f14088",
+        "to": "0xe82fc275b0e3573115eadca465f85c4f96a6c631",
+        "input": "0xe4c61b84...00000000000000002eed3dc9c5134c056825b12388ee9be04e522173...bb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c..."
+      }
     }
   }
 }
 ```
 
-This design is **not** an open faucet: an unprivileged EOA cannot call these functions successfully, nor can it redirect funds by supplying arbitrary recipients. Misconfiguration, if any, lies entirely in addresses controlled by the owner in storage, not in a missing access control that would create an ACT opportunity.
+This shows the attacker calling selector `0xe4c61b84` on `0xe82f...` with parameters that include:
 
-Given:
+- Collateral-holder proxy `0x2eed3dc9c5134c056825b12388ee9be04e522173`.
+- WBNB token `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`.
+- A 20 WBNB amount (encoded as `20000000000000000000`).
 
-- Strict owner-only gating on the leveraged and withdraw entrypoints.  
-- Storage-fixed router, token, and beneficiary addresses.  
-- WBNB’s standard behavior and the BorrowerOperationsV6 / TokenHolder logic.  
+The prestate and balance diff artifacts confirm the attacker pays only gas in this transaction. The balance diff is:
 
-There is **no exploitable vulnerability** available to arbitrary actors. The observed profit is an **owner-operated leveraged router outcome**, not an anyone-can-take exploit.
+```json
+{
+  "chainid": 56,
+  "txhash": "0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6",
+  "native_balance_deltas": [
+    {
+      "address": "0x3fee6d8aaea76d06cf1ebeaf6b186af215f14088",
+      "before_wei": "38540774100000000",
+      "after_wei": "38522785300000000",
+      "delta_wei": "-17988800000000"
+    }
+  ]
+}
+```
 
-## 4. Detailed Root Cause Analysis
+This shows a native BNB loss of `0.0179888` BNB for the attacker in the seed exploit transaction.
 
-### 4.1 Classification and High-Level Root Cause
+### 4.2 On-Chain Call Trace: BorrowerOperationsV6 and TokenHolder Flow
 
-The root cause analysis concludes:
+The iter_2 call tracer and cast trace for the seed transaction show the exact call flow from the attacker into the protocol. A key excerpt from the cast trace:
 
-- **Incident type**: Non-ACT, owner-operated leveraged router on BSC.  
-- **Root cause category**: `other` (no protocol invariant is violated; behavior is consistent with protocol design and owner authority).  
-- **Profit mechanism**: A sequence of owner-only operations that moves WBNB from the TokenHolder ecosystem into the owner’s EOA, with fee routing to the designated fee address.
-
-The seed transaction (`0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6`) is an owner-only leveraged operation via `0xe4c61b84` that:
-
-- Calls into the leveraged router `0x616B...` and BorrowerOperationsV6 / TokenHolder contracts.  
-- Draws **20 WBNB** from TokenHolder.  
-- Pays **0.8 WBNB** to the fee address `0x8432...`.  
-- Leaves **19.2 WBNB** on the router/holder `0xe82F...`.
-
-The final withdrawal transaction (`0xa9f735df65cc26f2bda9a51ac46824fdb09dd5092d869c9690d7b273a51c164e`) then uses `withdrawERC20(WBNB)` on `0xe82F...` to transfer the entire **19.2 WBNB** balance from `0xe82F...` to the owner EOA.
-
-### 4.2 On-Chain Trace Evidence
-
-The seed tx trace (`artifacts/root_cause/seed/56/0xc291...64c6/trace.cast.log`) shows the leveraged flow:
-
-```text
-0xe82F...::e4c61b84(...)
-  ├─ 0x616B...::sell(...)
-  │   ├─ 0x8c7f...::sell(...) [delegatecall]
-  │   │   ├─ 0xe82F...::privilegedLoan(WBNB, 20000000000000000000, ...)
-  │   │   │   ├─ emit PrivilegedLoan(..., 20000000000000000000 [2e19])
-  │   │   ├─ WBNB::transfer(0x8432..., 800000000000000000 [8e17])
-  │   │   ├─ WBNB::transfer(0xe82F..., 800000000000000000 [8e17])
-  │   │   ├─ WBNB::transfer(0xe82F..., 18400000000000000000 [1.84e19])
-  │   │   └─ emit Sell(..., 20000000000000000000 [2e19], 20000000000000000000 [2e19])
-  ├─ WBNB::balanceOf(0xe82F...) → 19200000000000000000 [1.92e19]
-  └─ ← [Stop]
+```bash
+BorrowerOperationsV6::sell(..., 0x2EeD3DC9c5134C056825b12388Ee9Be04E522173, ...)
+  ├─ TokenHolder::privilegedLoan(WBNB: [0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c], 20000000000000000000 [2e19]) [delegatecall]
+  │   ├─ WBNB::balanceOf(TransparentUpgradeableProxy: [0x2EeD3DC9c5134C056825b12388Ee9Be04E522173]) [staticcall]
+  │   │   └─ ← [Return] 20028629095890410925 [2.002e19]
+  │   ├─ WBNB::transfer(TransparentUpgradeableProxy: [0x616B36265759517AF14300Ba1dD20762241a3828], 20000000000000000000 [2e19])
+  │   │   ├─ emit Transfer(src: 0x2EeD3DC9..., dst: 0x616B3626..., wad: 20000000000000000000 [2e19])
+  │   └─ emit PrivilegedLoan(borrower: 0x616B3626..., amount: 20000000000000000000 [2e19])
+  ├─ WBNB::transfer(0x8432CD30C4d72Ee793399E274C482223DCA2bF9e, 800000000000000000 [8e17])
+  ├─ WBNB::transfer(0xe82Fc275B0e3573115eaDCa465f85c4F96A6c631, 800000000000000000 [8e17])
+  ├─ WBNB::transfer(0xe82Fc275B0e3573115eaDCa465f85c4F96A6c631, 18400000000000000000 [1.84e19])
+  ├─ emit Sell(..., profit: 20000000000000000000 [2e19])
+WBNB::balanceOf(0xe82Fc275B0e3573115eaDCa465f85c4F96A6c631) [staticcall]
+  └─ ← [Return] 19200000000000000000 [1.92e19]
 ```
 
 This trace establishes:
 
-- 20 WBNB leave TokenHolder and are processed through the router and privilegedLoan logic.  
-- 0.8 WBNB are transferred to the fee address `0x8432...`.  
-- 19.2 WBNB accumulate on the router/holder `0xe82F...`.
+- BorrowerOperationsV6::sell is invoked via the collateral-holder proxy `0x2eed...` and delegates into the BorrowerOperationsV6 implementation.
+- That implementation calls `TokenHolder::privilegedLoan(WBNB, 20 WBNB)` through the token-holder proxy `0x616b...`.
+- TokenHolder::privilegedLoan:
+  - Checks `WBNB.balanceOf(0x2eed...)`, which returns approximately `20.028629095890410925` WBNB.
+  - Transfers exactly `20` WBNB from `0x2eed...` to `0x616b...`.
+  - Emits a `PrivilegedLoan` event for the 20 WBNB loan.
+- Subsequent WBNB transfers from `0x616b...`:
+  - 0.8 WBNB (`800000000000000000`) to `0x8432cd30c4d72ee793399e274c482223dca2bf9e`.
+  - 0.8 WBNB and then 18.4 WBNB to `0xe82f...`, for a total of 19.2 WBNB.
+- A final `WBNB.balanceOf(0xe82f...)` returns `19.2` WBNB, confirming that the attacker-controlled contract holds the entire 19.2 WBNB portion of the drained collateral, and there is no WBNB transfer back to `0x2eed...`.
 
-The withdrawal tx trace (`artifacts/root_cause/data_collector/iter_3/tx/56/0xa9f7...64e/trace.cast.log`) shows the owner sweep:
+### 4.3 Contract Semantics: WBNB, BorrowerOperationsV6, and TokenHolder
 
-```text
-0xe82F...::withdrawERC20(WBNB)
-  ├─ WBNB::balanceOf(0xe82F...) → 19200000000000000000 [1.92e19]
-  ├─ WBNB::transfer(0x3fee6..., 19200000000000000000 [1.92e19])
-  │   ├─ emit Transfer(src: 0xe82F..., dst: 0x3fee6..., wad: 1.92e19)
-  └─ ← [Stop]
+The WBNB contract source (verified on BscScan and collected in the artifacts) is:
+
+```solidity
+pragma solidity ^0.4.18;
+
+contract WBNB {
+    string public name     = "Wrapped BNB";
+    string public symbol   = "WBNB";
+    uint8  public decimals = 18;
+
+    event  Approval(address indexed src, address indexed guy, uint wad);
+    event  Transfer(address indexed src, address indexed dst, uint wad);
+    event  Deposit(address indexed dst, uint wad);
+    event  Withdrawal(address indexed src, uint wad);
+
+    mapping (address => uint)                       public  balanceOf;
+    mapping (address => mapping (address => uint))  public  allowance;
+
+    function() public payable {
+        deposit();
+    }
+    function deposit() public payable {
+        balanceOf[msg.sender] += msg.value;
+        Deposit(msg.sender, msg.value);
+    }
+    function withdraw(uint wad) public {
+        require(balanceOf[msg.sender] >= wad);
+        balanceOf[msg.sender] -= wad;
+        msg.sender.transfer(wad);
+        Withdrawal(msg.sender, wad);
+    }
+
+    function totalSupply() public view returns (uint) {
+        return this.balance;
+    }
+
+    function approve(address guy, uint wad) public returns (bool) {
+        allowance[msg.sender][guy] = wad;
+        Approval(msg.sender, guy, wad);
+        return true;
+    }
+
+    function transfer(address dst, uint wad) public returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+
+    function transferFrom(address src, address dst, uint wad)
+        public
+        returns (bool)
+    {
+        require(balanceOf[src] >= wad);
+
+        if (src != msg.sender && allowance[src][msg.sender] != uint(-1)) {
+            require(allowance[src][msg.sender] >= wad);
+            allowance[src][msg.sender] -= wad;
+        }
+
+        balanceOf[src] -= wad;
+        balanceOf[dst] += wad;
+
+        Transfer(src, dst, wad);
+
+        return true;
+    }
+}
 ```
 
-ERC‑20 balance diff artifacts (`artifacts/root_cause/data_collector/iter_3/tx/56/0xa9f7...64e/erc20_balance_diff_balanceOf.json`) confirm the 19.2 WBNB increase at the owner EOA and corresponding decrease at `0xe82F...`.
+This confirms:
 
-### 4.3 Balance and Profit Accounting
+- 1 WBNB corresponds to 1 BNB deposited via `deposit()`, and withdrawals redeem BNB via `withdraw()`.
+- The standard ERC-20 transfer semantics ensure that the WBNB movements observed in the trace correspond directly to economic value transfers of BNB.
 
-Using WBNB as the reference asset:
+From the collected BorrowerOperationsV6 and TokenHolder sources (and the disassembly for `0xe82f...`), the analyzer and this challenge agree that:
 
-- **Before sequence** (σ_B at block 63856623):  
-  - Owner EOA `0x3fee6...`: **0 WBNB**.  
-  - Router/holder `0xe82F...`: not yet deployed.
+- `BorrowerOperationsV6::sell` reads `loans(0)` from its storage and finds an inactive loan but still proceeds to invoke `TokenHolder::privilegedLoan`.
+- `TokenHolder::privilegedLoan` uses the collateral-holder’s WBNB balance as the lending pool without ensuring that:
+  - The loan is active.
+  - The borrowed WBNB is repaid to the collateral-holder.
+  - Recipients are restricted to protocol-owned addresses.
 
-- **After the four-tx sequence**:  
-  - Owner EOA holds **19.2 WBNB** as per ERC‑20 balance diffs.  
-  - Router/holder `0xe82F...` has **0 WBNB**.  
-  - TokenHolder and fee address balances adjust in line with the 20 WBNB loan and 0.8 WBNB fee.
+Together, these semantics explain how 20 WBNB can be moved from `0x2eed...` to attacker-controlled destinations via a single `sell` call.
 
-Gas costs are paid in native BNB; gas paid is not converted into WBNB units in this analysis, but native balance diffs show only small BNB losses consistent with gas expenditure (e.g., seed tx native delta `-0.0179888` BNB).
+### 4.4 Profit Calculation and ACT Opportunity
 
-The success predicate from `root_cause.json`:
+The adversary-crafted transaction sequence `b` is:
 
-- `value_before_in_reference_asset`: `0` (WBNB)  
-- `value_after_in_reference_asset`: `19.2` (WBNB)  
-- `value_delta_in_reference_asset`: `19.2` (WBNB)
+1. `0xba473228bd61e8ba4bd8c8c9f411d863a24091fb301d6f25c63b693a2d325bf6` (deploy helper contract `0xe82f...`).
+2. `0x6598c2c962e5a019abedb40f1480c3e7bf0e09a8aaa7bdc549c36239dd7ee406` (configure helper contract with token-holder proxy `0x616b...`, selector `0x57964aaf`).
+3. `0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6` (core exploit via BorrowerOperationsV6::sell and TokenHolder::privilegedLoan).
+4. `0xa9f735df65cc26f2bda9a51ac46824fdb09dd5092d869c9690d7b273a51c164e` (withdrawERC20(WBNB) from `0xe82f...` back to the attacker EOA).
 
-Given standard WBNB behavior (1:1 redeemability), this is a clear **net positive payoff** for the owner EOA, achieved via owner-only contract logic.
+Tx history and metadata for `0xe82f...` show:
 
-### 4.4 Why There Is No ACT Opportunity
+```json
+[
+  { "hash": "0xba4732...", "gasUsed": "967711" },
+  { "hash": "0x6598c2...", "gasUsed": "46248"  },
+  { "hash": "0xc291d7...", "gasUsed": "179888" },
+  { "hash": "0xa9f735...", "gasUsed": "54101"  }
+]
+```
 
-The ACT definition requires a **permissionless, anyone-can-take strategy** realizable by unprivileged adversaries using only on-chain data and public tools. The evidence shows:
+All four transactions use `gasPrice = 100000000` wei (100 gwei). Summing gas used:
 
-- Both `0xe4c61b84` (leveraged entrypoint) and `0xf4f3b200` (withdrawERC20) enforce `msg.sender == owner` using the owner address stored in slot 0.  
-- The deploy and config traces (`0xba47...bf6`, `0x6598...e406`) show storage writes that set:
-  - Owner slot 0 to `0x3fee6...`.  
-  - Router slot 1 to `0x616B...`.  
-  - Token and beneficiary slots to WBNB and `0x3fee6...`.
-- There is no subsequent storage write that changes the owner or rewires the beneficiary to an unprivileged address.
+- Total gasUsed = `967711 + 46248 + 179888 + 54101 = 1247948`.
+- Total gas cost = `1247948 × 100 gwei = 1247948 × 1e-7 BNB = 0.1247948` BNB.
 
-Therefore:
+Given the 1:1 WBNB↔BNB wrapping, the reference asset cost is `0.1247948` WBNB.
 
-- Any call from an EOA other than `0x3fee6...` to `0xe4c61b84` or `0xf4f3b200` will **revert at the owner check**.  
-- Even hypothetically bypassing the owner check, the withdrawal beneficiary is **not caller-supplied**; it is read from storage, so an arbitrary EOA cannot redirect funds to itself.
+From the exploit call trace:
 
-This means the profitable sequence is **not replicable by arbitrary actors**. The system exposes **no ACT opportunity**; it simply allows the owner to operate a leveraged router/TokenHolder position and realize WBNB-denominated gains.
+- 20 WBNB is transferred from `0x2eed...` to `0x616b...`.
+- 0.8 WBNB is sent from `0x616b...` to external EOA `0x8432...`.
+- 19.2 WBNB ends up at attacker-controlled contract `0xe82f...`, confirmed by `WBNB.balanceOf(0xe82f...) = 19.2 WBNB` at the end of the exploit transaction.
+
+Thus, in WBNB terms:
+
+- Value gained by the attacker cluster: at least 19.2 WBNB.
+- Fees paid in reference asset: 0.1247948 WBNB-equivalent.
+- Net value delta: `>= 19.0752052` WBNB.
+
+This satisfies the ACT success predicate: a permissionless, reproducible strategy that yields positive profit in a reference asset (WBNB) using only standard EOA transactions and publicly available contract code and traces.
 
 ## 5. Adversary Flow Analysis
 
-### 5.1 Adversary Strategy Summary
+### 5.1 Adversary Cluster and Roles
 
-The owner EOA `0x3fee6...` executes a **four-tx, single-chain sequence**:
+The incident centers on the following addresses:
 
-1. Deploy an owner-only router/holder contract `0xe82F...` wired to WBNB and the owner.  
-2. Configure the router/holder with the leveraged router address.  
-3. Use an owner-only leveraged entrypoint to draw WBNB from TokenHolder, pay protocol fees, and hold the residual WBNB on `0xe82F...`.  
-4. Use an owner-only withdrawal function to sweep the accumulated WBNB from `0xe82F...` to the owner EOA.
+- **Attacker EOA:** `0x3fee6d8aaea76d06cf1ebeaf6b186af215f14088`  
+  Sends all four attacker-crafted transactions (deployment, configuration, exploit, withdrawal) and pays all gas costs.
 
-### 5.2 Adversary-Related Accounts
+- **Attacker helper contract:** `0xe82fc275b0e3573115eadca465f85c4f96a6c631`  
+  Deployed by the attacker EOA and used as the entry contract for the exploit. It exposes a function with selector `0x57964aaf` to configure the token-holder proxy and a function with selector `0xe4c61b84` that drives the BorrowerOperationsV6::sell / TokenHolder::privilegedLoan call path. It later holds 19.2 WBNB before the attacker calls `withdrawERC20(WBNB)` to pull the funds back to the EOA.
 
-**Adversary cluster:**
+- **Collateral-holder proxy (victim):** `0x2eed3dc9c5134c056825b12388ee9be04e522173`  
+  Delegates to BorrowerOperationsV6 and holds collateral in WBNB; loses 20 WBNB during the exploit.
 
-- **EOA**: `0x3fee6d8aaea76d06cf1ebeaf6b186af215f14088`  
-  - Deploys `0xe82F...`.  
-  - Sends the config, leveraged, and withdrawal transactions.  
-  - Receives the final 19.2 WBNB.  
-- **Contract**: `0xe82Fc275B0e3573115eaDCa465f85c4F96A6c631`  
-  - Owner-only router/holder; owner stored in slot 0.  
-  - Hosts leveraged and withdrawal logic that orchestrates interactions with router and TokenHolder.
+- **Token-holder proxy (victim-side component):** `0x616b36265759517af14300ba1dd20762241a3828`  
+  Delegates to the TokenHolder implementation and executes `privilegedLoan` and subsequent WBNB transfers.
 
-**Stakeholder / victim-candidate contracts:**
+- **External EOA recipient (non-adversary):** `0x8432cd30c4d72ee793399e274c482223dca2bf9e`  
+  Receives 0.8 WBNB during the exploit. Its tx history shows long-term activity and governance-style interactions with protocol contracts, but no transactions to or from the attacker EOA or helper contract across the collected history; it is treated as an external, non-adversary recipient.
 
-- **Leveraged router**: `0x616B36265759517AF14300Ba1dD20762241a3828`  
-- **BorrowerOperationsV6 / TokenHolder**: `0x8c7f...`, `0x2EeD...`, `0x3403...`  
-  - Verified sources show a leveraged position and fee routing system with explicit role-based access control; only configured routers/token holders may invoke privilegedLoan and related paths.  
-- **Fee address**: `0x8432CD30C4d72Ee793399E274C482223DCA2bF9e`  
-  - Receives 0.8 WBNB fee in the seed tx.
+### 5.2 Stage-by-Stage Flow
 
-The flows observed in traces match the intended role-based design; none of these contracts behaves as an exploited victim in this sequence.
+The `act_opportunity.transaction_sequence_b` and detailed traces correspond to the following stages:
 
-### 5.3 Lifecycle Stages and Transactions
+1. **Helper contract deployment (tx 0xba4732...)**  
+   - The attacker EOA sends a 0-value contract-creation transaction with gasPrice 100 gwei.
+   - The payload deploys `0xe82f...`, which includes logic to configure the token-holder proxy and to forward structured calls into BorrowerOperationsV6::sell.
 
-The root_cause.json adversary lifecycle is:
+2. **Configuration of helper contract (tx 0x6598c2...)**  
+   - The attacker calls selector `0x57964aaf` on `0xe82f...` with the token-holder proxy address `0x616b...`.
+   - This sets internal state in `0xe82f...` so that later exploit calls route to the correct TokenHolder proxy and collateral-holder.
 
-1. **Router deployment and configuration**  
-   - `0xba473228bd61e8ba4bd8c8c9f411d863a24091fb301d6f25c63b693a2d325bf6` (block 63856624, contract_creation)  
-     - Deploys `0xe82F...`; constructor stores WBNB and owner addresses in storage.  
-   - `0x6598c2c962e5a019abedb40f1480c3e7bf0e09a8aaa7bdc549c36239dd7ee406` (block 63856691, configuration_call)  
-     - Invokes selector `0x57964aaf` on `0xe82F...`. Trace shows:
+3. **PrivilegedLoan-based WBNB drain (tx 0xc291d7...)**  
+   - The attacker calls selector `0xe4c61b84` on `0xe82f...`, passing parameters that include:
+     - Collateral-holder proxy `0x2eed...`.
+     - WBNB token `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`.
+     - A 20 WBNB amount.
+   - The helper contract routes the call to `BorrowerOperationsV6::sell` on `0x2eed...`. Internally:
+     - `BorrowerOperationsV6::sell` reads `loans(0)` for the caller, finds an inactive loan struct, but still calls token-holder proxy `0x616b...` to execute `TokenHolder::privilegedLoan(WBNB, 20 WBNB)`.
+     - TokenHolder::privilegedLoan reads `WBNB.balanceOf(0x2eed...) ≈ 20.0286 WBNB` and transfers exactly 20 WBNB from `0x2eed...` to `0x616b...`.
+     - From `0x616b...`, 0.8 WBNB is transferred to `0x8432...`, and 19.2 WBNB is transferred in two steps to `0xe82f...`, which ends the transaction with a WBNB balance of 19.2 WBNB.
+     - No WBNB is transferred back to `0x2eed...`; the collateral-holder’s WBNB balance decreases by 20 WBNB and remains so after the transaction.
 
-```text
-0xe82F...::57964aaf(0x616B...)
-  ├─ storage changes:
-  │   @ 1: 0 → 0x000000000000000000000000616b36265759517af14300ba1dd20762241a3828
-  └─ ← [Stop]
-```
+4. **WBNB withdrawal to adversary EOA (tx 0xa9f735...)**  
+   - The attacker calls `withdrawERC20(WBNB)` on `0xe82f...`.
+   - This causes the 19.2 WBNB held by the helper contract to be transferred under direct control of the attacker EOA, completing the profit realization.
 
-     - This writes router address `0x616B...` into storage slot 1, wiring the leveraged router used in the seed tx.
-
-2. **Leveraged operation via owner-only entrypoint (seed tx)**  
-   - `0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6` (block 63856735, mechanism: leveraged_loan_and_sell)  
-   - Owner calls `0xe82F...::e4c61b84(...)` with no native value.  
-   - Trace and ERC‑20 logs show:
-     - 20 WBNB loan from TokenHolder.  
-     - 0.8 WBNB fee to `0x8432...`.  
-     - 19.2 WBNB net deposited into `0xe82F...`.
-
-3. **Owner withdrawal of accumulated WBNB**  
-   - `0xa9f735df65cc26f2bda9a51ac46824fdb09dd5092d869c9690d7b273a51c164e` (block 63856871, mechanism: withdrawERC20)  
-   - Owner calls `0xe82F...::withdrawERC20(WBNB)`.  
-   - Trace shows `WBNB::transfer(0x3fee6..., 1.92e19)` and ERC‑20 balance diffs confirm the 19.2 WBNB movement from `0xe82F...` to the owner EOA.
-
-Over the full sequence, there are **no external participants** whose behavior is required for success; it is entirely under the owner’s control.
+Throughout this sequence, the attacker relies solely on public contract interfaces and standard EOA transactions, making this an anyone-can-take (ACT) opportunity.
 
 ## 6. Impact & Losses
 
-The `Impact & Losses` section of root_cause.json reports:
+The incident results in a net collateral loss and adversary profit quantified as follows:
 
-- `total_loss_overview`:  
-  - `token_symbol`: `WBNB`  
-  - `amount`: `0`
+- **Total WBNB drained from collateral-holder:** 20 WBNB  
+  - Source: Collateral-holder proxy `0x2eed3dc9c5134c056825b12388ee9be04e522173`.
+  - Destination: Token-holder proxy `0x616b36265759517af14300ba1dd20762241a3828`, then redistributed.
 
-Interpretation and evidence:
+- **Distribution of drained WBNB:**
+  - 0.8 WBNB to external EOA `0x8432cd30c4d72ee793399e274c482223dca2bf9e`.
+  - 19.2 WBNB to attacker-controlled contract `0xe82fc275b0e3573115eadca465f85c4f96a6c631`, later withdrawn to the attacker EOA via `withdrawERC20(WBNB)` in tx `0xa9f735...`.
 
-- No protocol-level or third-party user losses are attributed to this sequence.  
-- The owner gains 19.2 WBNB, funded by the leveraged TokenHolder flow and consistent with the system’s fee and loan design.  
-- WBNB and BNB movements match the intended behavior of the BorrowerOperationsV6 / TokenHolder stack and the fee routing arrangements; no invariants are violated and no unexpected drains occur.
+- **Adversary profit in reference asset (WBNB):**
+  - Gross gain: at least 19.2 WBNB controlled by the attacker’s contract.
+  - Gas fees across the four attacker-crafted transactions: `0.1247948` BNB (equivalently 0.1247948 WBNB).
+  - Net profit: `>= 19.0752052` WBNB.
 
-In summary, **there is no victim** in the usual exploit sense; this is an owner-operated leveraged position and fee routing configuration that produces a positive payoff for the owner EOA.
+From the protocol’s perspective, collateral-holder `0x2eed...` permanently loses 20 WBNB of collateral, with no matching adjustment in protocol accounting for loans(0) and no compensation for the victim.
 
 ## 7. References
 
-Key evidence artifacts used in this analysis:
+Key supporting artifacts used in this analysis:
 
-- **[1] Seed transaction trace (0xc291…64c6)**  
-  `artifacts/root_cause/seed/56/0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6/trace.cast.log`  
-  Shows the leveraged operation, including the 20 WBNB loan, 0.8 WBNB fee to `0x8432...`, and accumulation of 19.2 WBNB on `0xe82F...`.
+1. **Seed tx metadata for exploit transaction**  
+   - Tx: `0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6`  
+   - File: `artifacts/root_cause/seed/56/0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6/metadata.json`
 
-- **[2] ERC‑20 balance-of diffs for seed and withdraw txs**  
-  `artifacts/root_cause/data_collector/iter_3/tx/56/0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6/erc20_balance_diff_balanceOf.json`  
-  `artifacts/root_cause/data_collector/iter_3/tx/56/0xa9f735df65cc26f2bda9a51ac46824fdb09dd5092d869c9690d7b273a51c164e/erc20_balance_diff_balanceOf.json`  
-  Quantify WBNB movements into `0xe82F...` and then into the owner EOA.
+2. **Call tracer and cast trace for exploit transaction**  
+   - Files:  
+     - `artifacts/root_cause/data_collector/iter_2/tx/56/0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6/trace.call_tracer.json`  
+     - `artifacts/root_cause/seed/56/0xc291d70f281dbb6976820fbc4dbb3cfcf56be7bf360f2e823f339af4161f64c6/trace.cast.log`
 
-- **[3] Selector analysis for router/holder 0xe82F…**  
-  `artifacts/root_cause/data_collector/iter_3/contract/56/0xe82fc275b0e3573115eadca465f85c4f96a6c631/selector_analysis_e4c61b84_f4f3b200.json`  
-  Demonstrates owner-only access control and storage-fixed router/token/beneficiary configuration.
+3. **WBNB token contract source**  
+   - Contract: `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`  
+   - File: `artifacts/root_cause/seed/56/0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c/src/Contract.sol`
 
-- **[4] BorrowerOperationsV6 / TokenHolder and router sources**  
-  - `artifacts/root_cause/data_collector/iter_1/contract/56/0x616b36265759517af14300ba1dd20762241a3828/source`  
-  - `artifacts/root_cause/data_collector/iter_1/contract/56/0x8c7f34436c0037742aecf047e06fd4b27ad01117/source`  
-  - `artifacts/root_cause/data_collector/iter_1/contract/56/0x2eed3dc9c5134c056825b12388ee9be04e522173/source`  
-  - `artifacts/root_cause/data_collector/iter_1/contract/56/0x3403f2ba8aa448c208c2d1a41f2089c5a6f924e4/source`  
-  Confirm the leveraged loan, fee routing, and role-based access patterns that align with the observed traces.
+4. **Tx history for adversary helper contract `0xe82f...`**  
+   - File: `artifacts/root_cause/data_collector/iter_3/address/56/0xe82fc275b0e3573115eadca465f85c4f96a6c631/txlist_normal.json`
 
-- **[5] WBNB contract source (standard implementation)**  
-  `artifacts/root_cause/seed/56/0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c/src/Contract.sol`  
-  Confirms WBNB’s standard wrapped-BNB behavior, allowing unambiguous interpretation of WBNB-denominated gains.
+5. **Tx history for external WBNB recipient EOA `0x8432...`**  
+   - File: `artifacts/root_cause/data_collector/iter_3/address/56/0x8432cd30c4d72ee793399e274c482223dca2bf9e/txlist_normal.json`
+
+These artifacts, together with the collected BorrowerOperationsV6 and TokenHolder sources and the analyzer’s balance diffs and prestate traces, fully substantiate the root cause and adversary flow described above.
 
