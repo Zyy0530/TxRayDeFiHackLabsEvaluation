@@ -1,0 +1,12 @@
+{
+    "is_act":true,
+    "root_cause": {
+        "discovered": true,
+        "aligned": false
+    },
+    "poc": {
+        "generated": true,
+        "runnable": true
+    },
+    "reason":"The root cause lies in the transient storage collision in the uniswapV3SwapCallback function, which uses slot 1 both for the Uniswap pool address and the minted token amount."
+}

@@ -1,0 +1,12 @@
+{
+    "is_act":true,
+    "root_cause": {
+        "discovered": false,
+        "aligned": false
+    },
+    "poc": {
+        "generated": true,
+        "runnable": true
+    },
+    "reason":"The attacker repeatedly transferred tokens to the pair to trigger the swapbuy logic, sandwiching this process to ultimately profit."
+}

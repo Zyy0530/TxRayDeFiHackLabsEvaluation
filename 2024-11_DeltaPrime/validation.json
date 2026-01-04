@@ -1,0 +1,12 @@
+{
+    "is_act":true,
+    "root_cause": {
+        "discovered": false,
+        "aligned": false
+    },
+    "poc": {
+        "generated": true,
+        "runnable": true
+    },
+    "reason":"reentrency vulnerability not confirmed"
+}
