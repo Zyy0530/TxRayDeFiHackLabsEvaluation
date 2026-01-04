@@ -6,6 +6,6 @@
     },
     "poc": {
         "generated": true,
-        "runnable": true
+        "runnable": false
     }
 }

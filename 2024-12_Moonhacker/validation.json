@@ -1,7 +1,7 @@
 {
     "is_act":true,
     "root_cause": {
-        "discovered": false,
+        "discovered": true,
         "aligned": false
     },
     "poc": {
