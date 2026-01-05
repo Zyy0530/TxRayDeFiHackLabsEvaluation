@@ -2,11 +2,10 @@
     "is_act":true,
     "root_cause": {
         "discovered": true,
-        "aligned": false
+        "aligned": true
     },
     "poc": {
         "generated": true,
         "runnable": true
-    },
-    "reason":"root cause is the proxy’s exchange() letting buy low / sell high"
+    }
 }
