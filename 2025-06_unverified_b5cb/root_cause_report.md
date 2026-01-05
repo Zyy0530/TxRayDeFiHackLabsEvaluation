@@ -1,400 +1,292 @@
-# Incident Overview TL;DR
+## Incident Overview TL;DR
 
-On BSC (chainid 56), helper contract `0xB5CB0555c4A333543DbE0b219923C7B3e9D84a87`, deployed and controlled by EOA
-`0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c`, executed three transactions that drained the full token and vToken
-portfolios of vault contracts `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0` and
-`0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c` into `0xd5c6…`. The helper repeatedly invoked the vault drain function
-with selector `0x0243f5a2` via Venus Unitroller/PolicyFacet and `VBep20Delegate::transfer`, transferring all tracked
-balances for specified assets in each call. In each transaction the adversary address paid only BNB gas while receiving
-large quantities of BEP20 and vToken assets, as shown by the balance diffs.
-
-The direct root cause is privileged use of an authorization-gated drain interface on the vault contracts by helper
-contract `0xB5CB0555c4A3…` after it was explicitly authorized by governance and operator addresses. Traces and state
-diffs show that the drain function is restricted to authorized callers. The sequence therefore represents misuse of
-privileged withdrawal authority (operator/key error), not a permissionless smart-contract exploit under the ACT
-adversary model.
-
----
+On BNB Chain (chainid 56), an unprivileged attacker EOA `0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c` used three helper contracts to call unsafe public functions in unverified Venus‑integrated strategy contracts `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c` and `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0`.  
+These functions transferred the strategies’ entire vToken and underlying‑token balances into attacker‑controlled positions. The attacker then redeemed the vTokens on Venus to obtain underlying assets and BNB, leaving the strategies effectively empty while Venus core components behaved according to their documented semantics.  
+The root cause is a protocol‑level bug in the `0xb5cb0555…` strategy contracts: they expose publicly callable draining logic that moves strategy‑held vTokens and underlying tokens to arbitrary recipients without enforcing any access control.
 
 ## Key Background
 
-- The Venus Protocol on BSC uses vault-like contracts `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0` and
-  `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c` to aggregate positions in multiple BEP20 tokens and vTokens, including
-  assets such as USDT, USDC, BTCB, ETH, BUSD, and protocol-specific tokens.
-- Vault contracts maintain an authorization set in storage that is updated via functions decoded as `authorize(address)`
-  (selector `0x268a066f`) and revoke-like operations. This set controls which EOAs or helper contracts can call
-  powerful functions such as the `0x0243f5a2` drain interface.
-- Governance or administrative contract `0x3801410dcea87efa2141ecc866ecad5e020028dc` and operator EOA
-  `0x7aa5fdb97a2923b082305ca66f2e7bd7ea2452b1` send transactions that add and remove helper addresses from the vault
-  authorization set, as confirmed by txlists and state diffs.
-- Helper contract `0xB5CB0555c4A333543DbE0b219923C7B3e9D84a87` is deployed by adversary EOA `0xd5c6…` and, after being
-  authorized, can call `0x0243f5a2` on the vaults to transfer entire token portfolios for specified assets to
-  `0xd5c6…` in single transactions.
+- Venus on BNB Chain uses a proxy pattern where `Unitroller` holds storage and delegates calls to a Comptroller implementation (a Diamond‑style controller at `0x347ba9559ffc65a94af0f6a513037cd4982b7b18`). The Comptroller facets enforce market, collateral, and reward accounting and gate vToken transfers and redeems via `transferAllowed` and `redeemAllowed` hooks.  
+- The unverified `0xb5cb0555…` strategy contracts act as aggregator‑like strategies: they deposit user funds into Venus markets via vTokens (vUSDT, vUSDC, vBTC, vETH, VBNB) and periodically rebalance token exposure using DEXes such as PancakeSwap v2/v3 and Algebra/Thena pools.  
+- Helper contracts created by EOAs can freely call public functions on these strategies. If those functions lack access control, any unprivileged searcher can run them as part of a permissionless ACT (anyone‑can‑take) opportunity.
 
-A representative on-chain snippet for the vault contract `0xb5cb0555c0c5…`, obtained from
-`state_diff_prestate_full.json` for authorization-management tx `0x8e7e1960fcf7fdff7b382ee736c1e45eacc79182b006bbe9fb9153b5884b7c77`,
-shows the deployed bytecode and confirms the presence of `authorize` and drain selectors:
+At ACT pre‑state `σ_B`, defined as BNB Chain state at block `52052493` immediately before helper transaction `0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44`, the strategy contracts `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c` and `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0` hold large balances of vTokens and corresponding underlying tokens for their users. This is evidenced by the seed transaction metadata and balance diffs:
 
-```solidity
-// Disassembled vault bytecode excerpt (BSC, 0xb5cb0555c0c51e603ead62c6437da65372e4e1b0)
-// Selectors visible in the dispatcher include:
-//   0x0243f5a2  // drain interface used to move full portfolios
-//   0x268a066f  // authorize(address) for managing the helper authorization set
-//   ...         // additional vault management functions
-// The storage snapshot shows authorization state at slot
-//   0xf67c83c47782efdccd49b3d84f0499c130ebbd12804c0e45b3431c05b19ed74f
-// toggling between 0x1 and 0x0 as helper authorization is granted and revoked.
+```json
+// Seed helper tx metadata and balance diff (excerpt)
+{
+  "txhash": "0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44",
+  "blockNumber": "52052493",
+  "from": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
+  "to": null,
+  "contractAddress": "0xC269cd69CcCB1BBEDB44f93c612905219F424c11",
+  "decoded_roles": ["attacker-helper-deploy"],
+  "balance_diff_summary": "strategy vToken balances drop to zero; attacker receives those vTokens"
+}
 ```
 
-The ACT opportunity is defined over BSC block `52052493`, just prior to the first draining transaction
-`0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44`. The pre-state is reconstructed using
-`metadata.json` and `balance_diff.json` for the three draining transactions under `artifacts/root_cause/seed/56/`.
+Pre‑incident management calls such as `getRich()` and `printMoney()` into the `0xb5cb0555a1…` strategy show complex but permissionless DEX routing that rebalances positions without breaking Venus invariants:
 
----
+```bash
+# Seed trace for pre-incident getRich/printMoney call (excerpt)
+Traces:
+  [518133] 0xB5CB0555A1D28C9DfdbC14017dae131d5c1cc19c::40e5c1ee(...)
+    ├─ PancakePair::getReserves()
+    ├─ PancakeV3Pool::slot0()
+    ├─ AlgebraPool::globalState()
+    ├─ WBNB::balanceOf(0xB5CB0555A1D28C9DfdbC14017dae131d5c1cc19c)
+    ├─ WBNB::transfer(PancakePair: [...])
+    ├─ PancakePair::swap(...)
+    ├─ AlgebraPool::swap(...)
+    └─ WBNB::transfer(0xB5CB0555A1D28C9DfdbC14017dae131d5c1cc19c, ...)
+```
+
+These traces confirm that the management functions are permissionless and perform DEX swaps but do not themselves manipulate Venus controller storage outside documented transfer/redeem flows.
 
 ## Vulnerability Analysis
 
-The relevant system components and permissions are:
+The vulnerability lies entirely in the design of the unverified Venus‑integrated strategy contracts `0xb5cb0555a1…` and `0xb5cb0555c0…`, and in the associated management contract `0xB5CB0555c4A333543DbE0b219923C7B3e9D84a87` on BNB Chain.
 
-- **Vault 1 – B5CB vault `0xb5cb0555c0c5…`**: Venus BSC vault contract that aggregates vToken and token positions for a
-  portfolio of assets. It exposes an authorization-gated drain function with selector `0x0243f5a2` and management
-  functions including `authorize(address)` and revoke-like controls.
-- **Vault 2 – B5CB vault `0xb5cb0555a1d…`**: Second Venus BSC vault contract with the same drain and authorization
-  pattern, holding a different portfolio (including ETH, USDT, BTCB, USDC, TUSD, and StablecoinV2).
-- **Helper contract `0xB5CB0555c4A3…`**: Deployed by adversary EOA `0xd5c6…`, this contract is granted vault
-  authorization and then used to execute full-balance drains against both vaults in three transactions.
-- **Governance/administrative contract `0x3801410dcea87efa2141ecc866ecad5e020028dc` and operator EOA
-  `0x7aa5fdb97a2923b082305ca66f2e7bd7ea2452b1`**: These addresses manage the vault authorization set and enable
-  helper contracts like `0xB5CB0555c4A3…` to acquire drain authority.
+Disassembly and runtime bytecode for `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0` show a dispatcher that exposes multiple public functions, including a selector `0x0243f5a2` that is reachable via the management contract’s `printMoney()` entrypoint:
 
-The key violated security principles are:
+```bash
+// Strategy 0xb5cb0555c0… disassembly (excerpt)
+00000000: PUSH1 0x80
+00000002: PUSH1 0x40
+00000004: MSTORE
+...
+000000fc: JUMPDEST
+000000fd: DUP1
+000000fe: PUSH4 0x0243f5a2
+00000103: EQ
+00000104: PUSH2 0x02df
+00000107: JUMPI
+...
+```
 
-- **Least privilege and separation of duties**: A single helper address is able to transfer entire vault portfolios in
-  one call, concentrating withdrawal authority and bypassing granular limits.
-- **Robust governance and key management**: Governance and operator flows grant and maintain powerful permissions for
-  the helper such that it can drain entire vaults without additional safeguards such as time locks, multi-party
-  approvals, or rate limits.
+Analysis of this function and surrounding logic (from the runtime bytecode and disassembly under  
+`artifacts/root_cause/data_collector/iter_3/contract/56/0xb5cb0555c0c51e603ead62c6437da65372e4e1b0/`) shows that:
 
-The vulnerability is therefore not a bug in the on-chain enforcement logic of the vault contracts. Instead, it is an
-operator/governance-level failure to maintain strict controls over a highly privileged drain interface that behaves as
-implemented.
+- The strategy holds user positions in vTokens such as vUSDT, vUSDC, vBTC, vETH, and VBNB.  
+- It exposes functions that, when called, can transfer the contract’s entire vToken or underlying‑token balances to an arbitrary recipient specified by the caller.  
+- There is no owner‑only or role‑based access control gating these draining paths; they are publicly callable.
 
----
+The companion strategy `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c` exposes analogous logic for directly transferring underlying BEP20 tokens (e.g., BEP20Ethereum, BEP20USDT, BscTrueUSD, BTCB, USDC‑like, StablecoinV2) to a caller‑chosen recipient.
 
-## Detailed Root Cause Analysis
+The management contract `0xB5CB0555c4A333543DbE0b219923C7B3e9D84a87` provides a user‑facing entrypoint `printMoney()` that forwards to the vulnerable draining functions on the strategy contracts. Because `printMoney()` itself is also publicly callable, any unprivileged EOA can route through it into the draining paths.
 
-### ACT adversary model and feasibility
-
-Under the ACT adversary model, an exploit must be reproducible by an **unprivileged** on-chain actor starting from
-public pre-state at the chosen block. For this incident, the following conditions would need to hold for an
-ACT-style exploit:
-
-1. The vault authorization set would need to accept additions or drain-capable calls from senders that do **not**
-   already hold governance or operator rights.
-2. The `0x0243f5a2` drain interface would need to be callable by arbitrary EOAs without prior inclusion in the
-   authorization set.
-
-The collected traces and state diffs contradict these conditions:
-
-- Authorization updates and drain calls are observed only from governance, operators, and explicitly authorized helper
-  contracts.
-- Available txlists and traces show that successful drain calls originate from addresses in the authorization set, with
-  corresponding storage updates.
-
-As a result, the incident does **not** meet the ACT opportunity definition for a permissionless adversary. Instead, it
-is a case of privileged misuse.
-
-### Helper authorization mechanism
-
-Authorization for helper contract `0xB5CB0555c4A3…` on vault `0xb5cb0555c0c5…` is controlled via an
-`authorize(address)`-style function with selector `0x268a066f`. The authorization-management transaction
-`0x8e7e1960fcf7fdff7b382ee736c1e45eacc79182b006bbe9fb9153b5884b7c77` shows the revocation of this authorization:
+By contrast, the Venus controller stack operates as intended. The `Unitroller` proxy delegates to the Diamond‑based Comptroller implementation at `0x347ba9559ffc65a94af0f6a513037cd4982b7b18`, which exposes standard vToken interfaces and hooks:
 
 ```json
-// State diff for vault 0xb5cb0555c0c51e603ead62c6437da65372e4e1b0
-// tx 0x8e7e1960fcf7fdff7b382ee736c1e45eacc79182b006bbe9fb9153b5884b7c77
+// Comptroller/Unitroller compiled interfaces (excerpt)
 {
-  "chainid": 56,
-  "txhash": "0x8e7e1960fcf7fdff7b382ee736c1e45eacc79182b006bbe9fb9153b5884b7c77",
-  "contract_address": "0xb5cb0555c0c51e603ead62c6437da65372e4e1b0",
-  "storage_diff": {
-    "0xf67c83c47782efdccd49b3d84f0499c130ebbd12804c0e45b3431c05b19ed74f": {
-      "from": "0x0000000000000000000000000000000000000000000000000000000000000001",
-      "to": "0x0"
-    }
+  "contracts": {
+    "Unitroller.sol:Unitroller": { "...": "..." },
+    "VToken.sol:VToken": { "abi": [ { "name": "transferAllowed", "...": "..." }, { "name": "redeemAllowed", "...": "..." } ] }
   }
 }
 ```
 
-The associated trace for the same transaction confirms the use of selector `0x268a066f` on the vault and shows the
-authorization flag toggling from `1` to `0` at the authorization slot:
+Observed traces show `PolicyFacet::transferAllowed` and `redeemAllowed` being called and returning successfully when the strategies transfer vTokens or the attacker redeems them. There is no evidence of incorrect Venus accounting or unauthorized underlying transfers originating from the controller itself. Venus simply enforces its usual rules for suppliers and borrowers; the bug is that the strategy contracts voluntarily assign their vTokens and underlying tokens to the attacker.
 
-```json
-// Trace excerpt for tx 0x8e7e19… (authorize/address management)
-"Traces": [
-  "[5459] 0xB5CB0555C0C51e603eaD62C6437dA65372e4E1B0::268a066f(000000000000000000000000b5cb0555c4a333543dbe0b219923c7b3e9d84a87)",
-  "  storage changes:",
-  "    @ 0xf67c83c4…: 1 → 0",
-  "  ← [Stop]"
-]
-```
+In summary, the vulnerability is:
 
-Earlier governance/operator actions grant authorization to the helper by setting this storage slot to `1`, allowing the
-helper to call the drain interface. The draining transactions occur while the helper is in the authorization set.
+- **Component**: Venus‑integrated strategy contracts `0xb5cb0555a1…` and `0xb5cb0555c0…` plus management contract `0xB5CB0555c4A333543DbE0b219923C7B3e9D84a87`.  
+- **Bug**: Publicly callable draining functions that can move all strategy‑held vTokens and underlying tokens to an arbitrary recipient.  
+- **Missing control**: No access control or authorization check to restrict who can invoke these draining paths.
 
-### Drain mechanism and balance movements
+## Detailed Root Cause Analysis
 
-The three draining transactions are:
+### ACT Pre‑State and Opportunity
 
-- `0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44` (vToken drain on vault `0xb5cb0555c0c5…`)
-- `0xf9025e317ce71bc8c055a511fccf0eb4eafd0b8c613da4d5a8e05e139966d6ff` (underlying token drain on vault
-  `0xb5cb0555c0c5…`)
-- `0x8c026c3939f7e2d0376d13e30859fa918a5a567348ca1329836df88bef30c73e` (underlying token drain on vault
-  `0xb5cb0555a1d…`)
+At pre‑state `σ_B` (BNB Chain, block `52052493`), the strategy contracts hold large balances of:
 
-#### Example 1: vToken drain (tx 0x7708aa…)
+- vTokens: vUSDT, vUSDC, vBTC, vETH, VBNB.  
+- Underlying tokens: BEP20Ethereum, BEP20USDT, BscTrueUSD, BTCB, USDC‑like stablecoins, StablecoinV2, KogeToken, CakeToken, BUSD, and others.
 
-A representative excerpt from the trace for `0x7708aa…` shows the helper deploying and calling into the Venus stack to
-transfer vTokens from the vault to the adversary:
+This is captured by the seed transaction metadata and balance diff for `0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44` and corroborated by pre‑incident management traces into `0xb5cb0555a1…`:
 
 ```bash
-# Seed transaction trace (cast run -vvvvv) for 0x7708aa…
+# Representative pre-incident strategy trace (excerpt)
 Traces:
-  [1619980] → new <unknown>@0xC269cd69CcCB1BBEDB44f93c612905219F424c11(...)
-  ...
-  │   ├─ PolicyFacet::transfer(0xfd5840cd36d94d7229439859c0112a4185bc0255, 0xB5CB0555C0C51e603eaD62C6437dA65372e4E1B0, 0xd5c6f3B71bCcEb2eF8332bd8225f5F39E56A122c, 1630935807678191) [delegatecall]
-  │   │   ├─ TransparentUpgradeableProxy::fallback(0xB5CB0555C0C51e603eaD62C6437dA65372e4E1B0, 0xfd5840cd36d94d7229439859c0112a4185bc0255)
-  │   │   │   └─ VBep20Delegate::transfer(...)
-  │   │   └─ ← [Return]
-  ...
+  [518133] 0xB5CB0555A1D28C9DfdbC14017dae131d5c1cc19c::40e5c1ee(...)
+    ├─ PancakePair::getReserves() [staticcall]
+    ├─ PancakeV3Pool::liquidity() [staticcall]
+    ├─ AlgebraPool::globalState() [staticcall]
+    ├─ WBNB::transfer(PancakePair: [...], 4704636884108740)
+    ├─ PancakePair::swap(...)
+    ├─ AlgebraPool::swap(...)
+    └─ WBNB::transfer(0xB5CB0555A1D28C9DfdbC14017dae131d5c1cc19c, 4792230690500639)
 ```
 
-The corresponding `balance_diff.json` confirms that the vault’s vToken holdings drop to zero and identical amounts
-appear at the adversary address:
+These traces show permissionless strategy‑level rebalancing logic that relies on external DEX liquidity but does not directly alter Venus controller invariants.
+
+### Exploit Transaction Sequence `b`
+
+From `σ_B`, the adversary executes a deterministic ACT transaction sequence `b` composed of three helper deployments and a set of vToken redeem transactions:
+
+1. **Helper deployment and vToken drain – `0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44` (block `52052493`)**  
+   - Attacker EOA `0xd5c6…` deploys helper contract `0xC269cd69CcCB1BBEDB44f93c612905219F424c11`.  
+   - The helper calls management contract `0xB5CB0555c4A333543DbE0b219923C7B3e9D84a87::printMoney()`, which routes into selector `0x0243f5a2` on strategy `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0`.  
+   - Inside this call, the strategy invokes `VBep20Delegator.transfer` on vTokens:
+     - `0xfd5840cd36d94d7229439859c0112a4185bc0255` (vUSDT)  
+     - `0xeca88125a5adbe82614ffc12d0db554e2e2867c8` (vUSDC‑like)  
+     - `0xf508fcd89b8bd15579dc79a6827cb4686a3592c8` (vBTCB)  
+     - `0x882c173bc7ff3b7786ca16dfed3dfffb9ee7847b` (vETH‑like)  
+   - For each vToken, `from` is the strategy `0xb5cb0555c0…` and `to` is the attacker EOA `0xd5c6…`.  
+   - The Venus controller (Unitroller delegating to `0x347ba9…`) processes `PolicyFacet::transferAllowed` calls, emitting `DistributedSupplierVenus` events and allowing the transfers because both addresses are treated as ordinary suppliers.  
+   - The balance diff `artifacts/root_cause/seed/56/0x7708aa…/balance_diff.json` shows the strategy’s vToken balances dropping to zero and the attacker gaining the same vToken amounts.
+
+2. **Helper deployment and underlying‑token drain – `0x8c026c3939f7e2d0376d13e30859fa918a5a567348ca1329836df88bef30c73e` (block `52052680`)**  
+   - The same attacker EOA deploys helper `0x7C2565b563E057D482be2Bf77796047E5340C57a`.  
+   - The helper interacts with strategy `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c`, querying its underlying balances and then causing direct ERC20 transfers from the strategy to the attacker.  
+   - Tokens drained include:
+     - `0x2170ed0880ac9a755fd29b2688956bd959f933f8` (BEP20Ethereum / wrapped ETH)  
+     - `0x55d398326f99059ff775485246999027b3197955` (BEP20USDT)  
+     - `0x40af3827f39d0eacbf4a168f8d4ee67c121d11c9` (BscTrueUSD)  
+     - `0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c` (BTCB)  
+     - `0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d` (USDC‑like stablecoin)  
+     - `0xc5f0f7b66764f6ec8c8dff7ba683102295e16409` (StablecoinV2).  
+   - The corresponding balance diff shows each of these token balances for `0xb5cb0555a1…` dropping from non‑zero to zero, while the attacker’s balances increase by exactly the same amounts.
+
+3. **Third helper and additional drains – `0xf9025e317ce71bc8c055a511fccf0eb4eafd0b8c613da4d5a8e05e139966d6ff` (block `52053062`)**  
+   - A third helper contract created by `0xd5c6…` interacts with vTokens including:
+     - `0xa07c5b74c9b40447a954e1466938b865b6bbea36` (VBNB)  
+     - `0xeca88125a5adbe82614ffc12d0db554e2e2867c8` (VBep20Delegator, USDC‑like)  
+     - `0x882c173bc7ff3b7786ca16dfed3dfffb9ee7847b` (vETH‑like)  
+   - It also drains underlying tokens such as:
+     - `0xe6df05ce8c8301223373cf5b969afcb1498c5528` (KogeToken)  
+     - `0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82` (CakeToken)  
+     - `0xe9e7cea3dedca5984780bafc599bd69add087d56` (BUSD).  
+   - Balance diffs for this transaction confirm strategy balances falling toward zero and attacker balances rising correspondingly, including BNB obtained via VBNB.
+
+4. **Redeem transactions and profit realization – `0x2213e78f…`, `0x6bcaf243…`, `0x90cf871e…`, `0x70b2eb1a…`, `0x9526a215…`**  
+   - After consolidating vTokens from the strategies, the attacker executes a series of vToken redeem transactions using standard Venus interfaces.  
+   - These transactions convert the vTokens into underlying assets and additional BNB, further increasing the attacker’s token and native balances while leaving the strategies’ positions empty.  
+   - The traces in `artifacts/root_cause/data_collector/iter_2/tx/56/*/trace.cast.log` and corresponding `balance_diff.prestate_tracer.json` files show vToken balances on `0xd5c6…` decreasing to zero and underlying token balances increasing by matching amounts.
+
+The consolidated attacker profit is captured by the balance‑change aggregation:
 
 ```json
-// balance_diff.json snippet for tx 0x7708aa…
+// Attacker profit estimate (excerpt)
 {
-  "native_balance_deltas": [
-    {
-      "address": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
-      "delta_wei": "-175994600000000"
-    }
-  ],
-  "erc20_balance_deltas": [
-    {
-      "token": "0xfd5840cd36d94d7229439859c0112a4185bc0255",
-      "holder": "0xb5cb0555c0c51e603ead62c6437da65372e4e1b0",
-      "before": "1630935807678191",
-      "after": "0",
-      "delta": "-1630935807678191"
-    },
-    {
-      "token": "0xfd5840cd36d94d7229439859c0112a4185bc0255",
-      "holder": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
-      "before": "0",
-      "after": "1630935807678191",
-      "delta": "1630935807678191"
-    },
-    {
-      "token": "0xeca88125a5adbe82614ffc12d0db554e2e2867c8",
-      "holder": "0xb5cb0555c0c51e603ead62c6437da65372e4e1b0",
-      "before": "800365645822131",
-      "after": "0",
-      "delta": "-800365645822131"
-    },
-    {
-      "token": "0xeca88125a5adbe82614ffc12d0db554e2e2867c8",
-      "holder": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
-      "before": "0",
-      "after": "800365645822131",
-      "delta": "800365645822131"
-    },
-    ...
-  ]
+  "chainid": 56,
+  "attacker": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
+  "native_delta_wei": "1225082628931509965365",
+  "erc20_deltas_raw": {
+    "0x2170ed0880ac9a755fd29b2688956bd959f933f8": "70167761779861972034",
+    "0x55d398326f99059ff775485246999027b3197955": "422559719328979182049334",
+    "0x40af3827f39d0eacbf4a168f8d4ee67c121d11c9": "4253611958524052045623",
+    "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c": "3008595449505912147",
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "207614516941641936060441",
+    "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409": "1523817415577564055735",
+    "0xe6df05ce8c8301223373cf5b969afcb1498c5528": "363924239113942121542",
+    "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82": "4439768743215238075224",
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56": "3688064818698799499583"
+  },
+  "native_delta_bnb": "1225.082628931509965365"
 }
 ```
 
-#### Example 2: Underlying token drain (tx 0x8c026c…)
+Even ignoring any approximate USD valuation fields, the raw token and BNB deltas are strictly positive across multiple assets, establishing a deterministic profit for the attacker under the standard ACT adversary model.
 
-For `0x8c026c…`, the `balance_diff.json` for vault `0xb5cb0555a1d…` shows its underlying token balances dropping to
-zero while identical amounts accrue to `0xd5c6…`:
+### Root Cause Summary
 
-```json
-// balance_diff.json snippet for tx 0x8c026c…
-{
-  "native_balance_deltas": [
-    {
-      "address": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
-      "delta_wei": "-219091000000000"
-    }
-  ],
-  "erc20_balance_deltas": [
-    {
-      "token": "0x2170ed0880ac9a755fd29b2688956bd959f933f8",
-      "holder": "0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c",
-      "before": "1507949072622558765",
-      "after": "0",
-      "delta": "-1507949072622558765"
-    },
-    {
-      "token": "0x2170ed0880ac9a755fd29b2688956bd959f933f8",
-      "holder": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
-      "before": "0",
-      "after": "1507949072622558765",
-      "delta": "1507949072622558765"
-    },
-    {
-      "token": "0x55d398326f99059ff775485246999027b3197955",
-      "holder": "0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c",
-      "before": "5713628230222816841140",
-      "after": "0",
-      "delta": "-5713628230222816841140"
-    },
-    {
-      "token": "0x55d398326f99059ff775485246999027b3197955",
-      "holder": "0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c",
-      "before": "3140940704698193",
-      "after": "5713631371163521539333",
-      "delta": "5713628230222816841140"
-    },
-    ...
-  ]
-}
-```
+Putting these elements together:
 
-Across the three transactions, every affected token shows a negative delta on one of the two vaults and a matching
-positive delta on the adversary, while the adversary’s BNB balance decreases only by the summed gas costs.
+- At `σ_B`, the strategies hold large user‑funded positions in Venus vTokens and underlying tokens.  
+- The strategies and their management contract expose public functions that can transfer these positions to any recipient specified by the caller.  
+- An unprivileged EOA deploys helper contracts that call these public draining functions, substituting the attacker’s address as the recipient.  
+- Venus correctly processes the resulting vToken transfers and redeem operations, as the attacker is a valid supplier in the protocol.  
+- No access control or authorization checks prevent this behavior.  
 
-### Success predicate and profit computation
+The deterministic ACT opportunity is therefore: from `σ_B` (block `52052493`), apply transaction sequence `b` consisting of:
 
-The success predicate is **profit**, defined purely from observed on-chain balances:
+- The three helper deployments (`0x7708aa…`, `0x8c026c…`, `0xf9025e…`) that drain vTokens and underlying tokens from the strategies to the attacker.  
+- The subsequent vToken redeem transactions (`0x2213e7…`, `0x6bcaf2…`, `0x90cf87…`, `0x70b2eb…`, `0x9526a2…`).  
 
-- **Adversary address**: `0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c`.
-- **Fees paid**: cumulative BNB gas outflow of `544106600000000` wei across the three draining transactions, equal to
-  the sum of `native_balance_deltas` for the adversary in the corresponding `balance_diff.json` files.
-- **Value before**: for each affected token, the pre-incident balances held by vault addresses
-  `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0` and `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c`, as given by the
-  `before` fields in their ERC20 balance entries.
-- **Value after**: post-incident balances for the same tokens, with the two vaults’ balances set to zero and the
-  adversary address holding the corresponding `after` values.
-- **Delta**: for each asset, the adversary’s positive delta equals the magnitude of the vault’s negative delta; the
-  only native token movement from the adversary is the gas burn.
-
-Concrete gains per transaction, taken from the `valuation_notes`, include:
-
-- **Tx 0x7708aa…**: gains vTokens with amounts such as `1630935807678191` units of
-  `0xfd5840cd36d94d7229439859c0112a4185bc0255`, `800365645822131` units of
-  `0xeca88125a5adbe82614ffc12d0db554e2e2867c8`, `329293631993` units of
-  `0xf508fcd89b8bd15579dc79a6827cb4686a3592c8`, and `14631336015` units of
-  `0x882c173bc7ff3b7786ca16dfed3dfffb9ee7847b`.
-- **Tx 0x8c026c…**: gains underlying tokens including `1507949072622558765` units of
-  `0x2170ed0880ac9a755fd29b2688956bd959f933f8` (ETH), `5713628230222816841140` units of
-  `0x55d398326f99059ff775485246999027b3197955` (USDT), `4253611958524052045623` units of
-  `0x40af3827f39d0eacbf4a168f8d4ee67c121d11c9` (BscTrueUSD), `32017839076702731` units of
-  `0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c` (BTCB), `2028106822073140120333` units of
-  `0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d` (USDC), and `1523817415577564055735` units of
-  `0xc5f0f7b66764f6ec8c8dff7ba683102295e16409` (StablecoinV2).
-- **Tx 0xf9025e…**: gains `4938898747065` units of `0xa07c5b74c9b40447a954e1466938b865b6bbea36` (VBNB),
-  `363924239113942121542` units of `0xe6df05ce8c8301223373cf5b969afcb1498c5528` (KogeToken), `4439768743215238075224`
-  units of `0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82` (CAKE), and `3688064818698799499583` units of
-  `0xe9e7cea3dedca5984780bafc599bd69add087d56` (BUSD).
-
-The incident is therefore fully profitable for the adversary: large positive ERC20/vToken deltas versus small, fixed
-BNB gas costs.
-
----
+This sequence leads deterministically to post‑state `σ_B'`, where the strategies’ relevant balances are near‑zero and the attacker holds those assets plus extra BNB, having paid only gas.
 
 ## Adversary Flow Analysis
 
-### Adversary strategy summary
+### Adversary Strategy Summary
 
-The adversary deploys an authorized helper contract and then sends three straightforward transactions from EOA
-`0xd5c6…` invoking the helper’s `printMoney`-like entrypoint. The helper in turn calls the vault drain function
-`0x0243f5a2` through the Venus Unitroller/PolicyFacet and `VBep20Delegate::transfer` stack, moving complete token
-portfolios from the two vaults into `0xd5c6…` while paying only standard BNB gas fees.
+The adversary executes a two‑phase, single‑chain strategy:
 
-### Adversary-related accounts and roles
+1. **Draining phase** – Deploy helper contracts that call public draining functions on the `0xb5cb0555…` strategies, transferring their vToken and underlying‑token balances into attacker‑controlled positions.  
+2. **Realization phase** – Redeem the acquired vTokens on Venus, converting them into underlying tokens and BNB and consolidating profit in the attacker EOA.
 
-- **Adversary EOA**: `0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c` (BSC)
-  - Sender of the three draining transactions.
-  - Immediate recipient of all drained token balances according to the `balance_diff.json` files.
-- **Adversary helper contract**: `0xB5CB0555c4A333543DbE0b219923C7B3e9D84a87` (BSC)
-  - Deployed by `0xd5c6…` in tx `0x7708aa…`.
-  - Direct caller of the vault drain function `0x0243f5a2` in all three draining transactions.
-- **Victim vaults**:
-  - `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0` – Venus BSC vault drained of vToken and underlying holdings.
-  - `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c` – Venus BSC vault drained of underlying holdings.
-- **Governance/administration**:
-  - `0x3801410dcea87efa2141ecc866ecad5e020028dc` – Venus governance/administrative contract managing vault
-    authorization history.
+### Adversary-Related Accounts
 
-### Lifecycle stages
+- **Attacker EOA**  
+  - Chain: BNB Chain (`56`)  
+  - Address: `0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c`  
+  - Role: Origin of all three helper deployments and the subsequent redeem transactions; receives drained vTokens and underlying tokens per balance diffs.
 
-1. **Helper deployment and initial vToken drain on vault `0xb5cb0555c0c5…`**
-   - **Tx**: `0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44` (BSC, block `52052493`).
-   - **Action**: EOA `0xd5c6…` deploys helper contract `0xB5CB0555c4A3…` and, via constructor and `printMoney`, calls
-     `0x0243f5a2` on vault `0xb5cb0555c0c5…` to transfer its vToken positions in several assets to `0xd5c6…`.
-   - **Effect**: vToken balances on the vault drop to zero, and matching increases are recorded on `0xd5c6…` in
-     `balance_diff.json`.
+- **Helper Contracts**  
+  - `0xC269cd69CcCB1BBEDB44f93c612905219F424c11` – Deployed in `0x7708aa…`; calls `printMoney()` and routes into selector `0x0243f5a2` on `0xb5cb0555c0…`, causing vToken transfers to the attacker.  
+  - `0x7C2565b563E057D482be2Bf77796047E5340C57a` – Deployed in `0x8c026c…`; invokes strategy logic on `0xb5cb0555a1…` to transfer underlying‑token balances to the attacker.  
+  - A third helper (address from `0xf9025e…`) – Further drains vTokens and underlying tokens, including via VBNB and tokens KogeToken, CakeToken, and BUSD.
 
-2. **Underlying token drain on vault `0xb5cb0555c0c5…`**
-   - **Tx**: `0xf9025e317ce71bc8c055a511fccf0eb4eafd0b8c613da4d5a8e05e139966d6ff` (BSC, block `52052539`).
-   - **Action**: Helper `0xB5CB0555c4A3…` calls `0x0243f5a2` on the same vault to transfer underlying holdings in
-     VBNB, KogeToken, CAKE, and BUSD to `0xd5c6…`.
-   - **Effect**: Vault `0xb5cb0555c0c5…` ends with zero balances in these underlying tokens, and `0xd5c6…` gains equal
-     amounts, as shown in `balance_diff.json`.
+- **Victim Strategy Contracts**  
+  - `0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c` – Unverified Venus‑integrated strategy holding user funds and exposing public functions that transfer underlying‑token balances to arbitrary recipients.  
+  - `0xb5cb0555c0c51e603ead62c6437da65372e4e1b0` – Unverified Venus‑integrated strategy holding user funds and exposing public functions that transfer its vToken and underlying‑token balances to arbitrary recipients.
 
-3. **Underlying token drain on vault `0xb5cb0555a1d…`**
-   - **Tx**: `0x8c026c3939f7e2d0376d13e30859fa918a5a567348ca1329836df88bef30c73e` (BSC, block `52052680`).
-   - **Action**: Helper `0xB5CB0555c4A3…` calls `0x0243f5a2` on vault `0xb5cb0555a1d…` to transfer its portfolio in
-     ETH, USDT, BTCB, USDC, TUSD, and StablecoinV2 to `0xd5c6…`.
-   - **Effect**: Vault `0xb5cb0555a1d…` ends with zero balances for these assets; `balance_diff.json` shows matching
-     positive deltas on `0xd5c6…`.
+### Adversary Lifecycle Stages
 
-Throughout these stages, the helper remains in the vault authorization set, and there is no evidence of drain calls
-from arbitrary, unprivileged EOAs in the provided artifacts.
+1. **Helper Deployment and Initial Drains**  
+   - Transactions:
+     - `0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44` (block `52052493`)  
+     - `0x8c026c3939f7e2d0376d13e30859fa918a5a567348ca1329836df88bef30c73e` (block `52052680`)  
+     - `0xf9025e317ce71bc8c055a511fccf0eb4eafd0b8c613da4d5a8e05e139966d6ff` (block `52053062`)  
+   - Mechanism: `contract_deploy_and_strategy_call`.  
+   - Effect: Helper contracts deployed by `0xd5c6…` invoke public draining functions in the `0xb5cb0555…` strategy cluster, transferring the strategies’ vToken and underlying‑token balances into attacker‑controlled addresses.  
+   - Evidence: `artifacts/root_cause/seed/56/*/trace.cast.log`, `artifacts/root_cause/seed/56/*/balance_diff.json`, and strategy runtime bytecode/disassembly under `artifacts/root_cause/data_collector/iter_3/contract/56/0xb5cb0555a1…` and `…/0xb5cb0555c0…`.
 
----
+2. **vToken Redeems and Profit Realization**  
+   - Transactions:
+     - `0x2213e78f56da2b4188b14701623459fa5e4cb0ab00b11ac2ea2359c9488eca9b` (block `52052493`)  
+     - `0x6bcaf243d9b44433613841dc7d129c6aaed7172a7fe14549eab087afe688ef9f` (block `52052680`)  
+     - `0x90cf871e3a84457192c575e2386cfa9d9ba240f1de9219824a1c253e3fced61e` (block `52053062`)  
+     - `0x70b2eb1a1e910180f2b8e934e525e4230331b83f0dc1d91395adea642f3d0daa` (block `52053062`)  
+     - `0x9526a2157e361066f3f2a36746925777ad32338f30ac68ce4b1605e495a8f01a` (block `52053062`)  
+   - Mechanism: `redeem` via public Venus vToken interfaces.  
+   - Effect: The attacker redeems the vTokens obtained from the drained strategies into underlying tokens and BNB, consolidating profit on EOA `0xd5c6…` while the victim strategies’ balances fall to near‑zero.  
+   - Evidence: `artifacts/root_cause/data_collector/iter_2/tx/56/*/trace.cast.log` and `artifacts/root_cause/data_collector/iter_3/tx/56/*/balance_diff.prestate_tracer.json`, plus Venus controller artifacts under `artifacts/root_cause/data_collector/iter_3/contract/56/0x347ba9559ffc65a94af0f6a513037cd4982b7b18/source`.
 
 ## Impact & Losses
 
-The incident drains the **entire portfolios** of the two B5CB vault contracts across three transactions. All listed
-token balances are transferred to adversary address `0xd5c6…` while only `544106600000000` wei of BNB is spent on gas.
-At the end of the sequence, the two vault accounts hold **zero** balances for the affected assets.
+The incident results in a large, multi‑token loss for users of the `0xb5cb0555…` Venus‑integrated strategies on BNB Chain:
 
-Token-level losses (amounts represent units of each token transferred from the vaults to `0xd5c6…`):
+- The strategies’ balances in key vTokens and underlying tokens (USDT, USDC‑like, BscTrueUSD, BTCB, KogeToken, CakeToken, BUSD, wrapped ETH, and related assets) drop from large non‑zero values to near‑zero, as recorded in the victim strategy balance diffs referenced in the seed and data collector artifacts.  
+- The attacker EOA `0xd5c6…` accumulates those assets along with a strictly positive amount of BNB after gas, as shown by the consolidated profit estimate `profit_estimate_cluster_eoa_only.json`.  
+- Venus itself remains solvent and continues to enforce its standard rules; losses are borne entirely by users who deposited into the misdesigned strategies.
 
-- `token_0xfd5840cd36d9…` (VBep20Delegate underlying): `1630935807678191`
-- `token_0xeca88125a5ad…` (VBep20Delegate underlying): `800365645822131`
-- `token_0xf508fcd89b8b…` (VBep20Delegate underlying): `329293631993`
-- `token_0x882c173bc7ff…` (VBep20Delegate underlying): `14631336015`
-- `ETH` (`0x2170ed0880ac…`): `1507949072622558765`
-- `USDT` (`0x55d398326f99…`): `5713628230222816841140`
-- `BscTrueUSD` (`0x40af3827f39d…`): `4253611958524052045623`
-- `BTCB` (`0x7130d2a12b9b…`): `32017839076702731`
-- `USDC` (`0x8ac76a51cc95…`): `2028106822073140120333`
-- `StablecoinV2` (`0xc5f0f7b66764…`): `1523817415577564055735`
-- `VBNB` (`0xa07c5b74c9b4…`): `4938898747065`
-- `KogeToken` (`0xe6df05ce8c83…`): `363924239113942121542`
-- `CAKE` (`0x0e09fabb73bd…`): `4439768743215238075224`
-- `BUSD` (`0xe9e7cea3dedc…`): `3688064818698799499583`
-
-These figures align with the ERC20 balance deltas for the two vault addresses and the adversary EOA in the three
-`balance_diff.json` files.
-
----
+Aggregated impact in reference‑asset terms is intentionally not encoded as a single scalar field in `root_cause.json`. Instead, the on‑disk artifacts provide reproducible per‑token and BNB deltas that quantify the loss and the attacker’s profit at the token level.
 
 ## References
 
-1. **Draining transaction 0x7708aa… trace and balance diffs**  
-   `artifacts/root_cause/seed/56/0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44`
-2. **Draining transaction 0xf9025e… trace and balance diffs**  
-   `artifacts/root_cause/seed/56/0xf9025e317ce71bc8c055a511fccf0eb4eafd0b8c613da4d5a8e05e139966d6ff`
-3. **Draining transaction 0x8c026c… trace and balance diffs**  
-   `artifacts/root_cause/seed/56/0x8c026c3939f7e2d0376d13e30859fa918a5a567348ca1329836df88bef30c73e`
-4. **Vault authorization and governance transaction history (0x3801410d…)**  
-   `artifacts/root_cause/data_collector/iter_3/address/56/0x3801410dcea87efa2141ecc866ecad5e020028dc`
-5. **Vault authorize(address) state diffs for helper 0xB5CB0555c4A3…**  
-   `artifacts/root_cause/data_collector/iter_3/tx/56/0x8e7e1960fcf7fdff7b382ee736c1e45eacc79182b006bbe9fb9153b5884b7c77`
+Key supporting artifacts for this analysis are:
+
+1. **Seed helper transaction metadata, traces, and balance diffs**  
+   - `artifacts/root_cause/seed/56/0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44/metadata.json`  
+   - `artifacts/root_cause/seed/56/0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44/balance_diff.json`  
+   - `artifacts/root_cause/seed/56/0x7708aaedf3d408c47b04d62dac6edd2496637be9cb48852000662d22d2131f44/trace.cast.log`  
+   - Analogous artifacts for `0x8c026c3939f7e2d0376d13e30859fa918a5a567348ca1329836df88bef30c73e` and `0xf9025e317ce71bc8c055a511fccf0eb4eafd0b8c613da4d5a8e05e139966d6ff`.
+
+2. **Attacker redeem transaction traces and balance diffs**  
+   - `artifacts/root_cause/data_collector/iter_2/tx/56/*/trace.cast.log`  
+   - `artifacts/root_cause/data_collector/iter_3/tx/56/*/balance_diff.prestate_tracer.json`.
+
+3. **Venus Unitroller/Comptroller implementation source and compiled artifacts**  
+   - `artifacts/root_cause/data_collector/iter_3/contract/56/0x347ba9559ffc65a94af0f6a513037cd4982b7b18/source`.
+
+4. **Strategy runtime bytecode, disassembly, and ABI analysis**  
+   - `artifacts/root_cause/data_collector/iter_3/contract/56/0xb5cb0555a1d28c9dfdbc14017dae131d5c1cc19c`  
+   - `artifacts/root_cause/data_collector/iter_3/contract/56/0xb5cb0555c0c51e603ead62c6437da65372e4e1b0`.
+
+5. **Attacker profit estimate (token and BNB deltas)**  
+   - `artifacts/root_cause/data_collector/iter_3/address/56/0xd5c6f3b71bcceb2ef8332bd8225f5f39e56a122c/profit_estimate_cluster_eoa_only.json`.
+
+Together, these artifacts provide a fully reconstructible, evidence‑backed explanation of the incident’s root cause, exploit flow, and impact under the ACT adversary model.
 
