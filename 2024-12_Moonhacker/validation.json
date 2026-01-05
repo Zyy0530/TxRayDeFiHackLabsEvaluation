@@ -2,10 +2,10 @@
     "is_act":true,
     "root_cause": {
         "discovered": true,
-        "aligned": false
+        "aligned": true
     },
     "poc": {
-        "generated": false,
-        "runnable": false
+        "generated": true,
+        "runnable": true
     }
 }
