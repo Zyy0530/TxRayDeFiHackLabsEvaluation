@@ -1,492 +1,293 @@
 ## Incident Overview TL;DR
 
-An unprivileged Ethereum mainnet EOA, `0x27defcfa6498f957918f407ed8a58eba2884768c`, used an unverified orchestrator/collateral token contract, `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`, to deploy a synthetic debt token `0x341c853c09b3691b434781078572f9d3ab9e3cbb`, create and seed a Uniswap V3 pool between `0x341c…` and `0xea55…`, bind that pool into the SIR Oracle `0x3CDCCFA37c1B2BEe3d810eC9dAddbB205048bB29` for a new vault (`vaultId = 21`) on the singleton Vault `0xb91ae2c8365fd45030aba84a4666c4db074e53e7`, and call `Vault.mint` to drain USDC and WBTC from the vault into attacker-controlled addresses in a single transaction (`0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f`).
+Owner EOA `0x27defcfa6498f957918f407ed8a58eba2884768c` sent transaction `0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f` in Ethereum mainnet block `22157900` to contract `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`, invoking function selector `0xcb01c553` (`cb01c553`). During this call, exactly `17,814,862,676` minimal units of USDC (FiatTokenV2_2 at `0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48`) were transferred from vault address `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` to the same owner EOA. The transaction is a direct owner call with no intermediary contract controlling `tx.origin`. Subsequent transactions from `0x27defcfa6498f957918f407ed8a58eba2884768c` route portions of the withdrawn USDC through swaps and a `shield(tuple[] _shieldRequests)` call to `0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9`.
 
-The root cause is a protocol-level design bug in how the Vault and Oracle allow arbitrary token pairs to be listed and priced using Uniswap TWAPs without whitelisting, liquidity quality checks, or protections against attacker-controlled tokens with extreme decimals. This design allowed an attacker to create a synthetic `0x341c/0xea55` Uniswap pool whose manipulated price induced `Vault.mint` to release large amounts of real USDC and WBTC from the Vault’s reserves. The incident is an ACT (anyone‑can‑take) opportunity: any unprivileged EOA can reproduce the exploit using only canonical on-chain data and public contracts.
-
-The adversary’s strategy uses two transactions:
-
-- Exploit transaction: `0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f` (block 22157900), which deploys `0x341c…`, creates and seeds the Uniswap V3 pool, initializes the oracle and vault, and mints against the manipulated price to pull USDC and WBTC from the Vault to attacker-controlled addresses.
-- Profit‑routing transaction: `0xaa52054c88c246e2a140459a0f47ec9ada469aa9e153a531dd788e5502709e27` (block 22157929), which uses a router at `0x00c600b30fb0400701010f4b080409018b9006e0` to swap the 17,814,862.676 USDC obtained from the exploit.
-
-Across these transactions, the attacker’s EOA gains 17,814,862.676 USDC from the Vault and approximately 1.40852920 WBTC, with gas fees bounded by at most 130,000 USDC‑equivalent under conservative ETH pricing, leaving a strictly positive net profit on the order of 1.78e7 USDC.
+The root cause is a centralized owner-only withdrawal capability: `cb01c553` enforces equality between `tx.origin`, `msg.sender`, and a single owner address stored in storage slot `0`, so only that owner can trigger the observed vault drain. From the publicly reconstructible pre-state immediately before block `22157900`, there is no transaction sequence available to an unprivileged adversary that reproduces this effect. This incident is therefore *not* an ACT opportunity; it is an owner-privilege misuse or failure at the protocol governance level.
 
 ## Key Background
 
-The SIR Vault/APE/TEA protocol on Ethereum mainnet uses a singleton Vault contract at `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` that tracks multiple leveraged vaults, each identified by `(debtToken, collateralToken, leverageTier)`. Users mint synthetic APE or TEA tokens by posting collateral and borrowing against a price reported by an Oracle contract at `0x3CDCCFA37c1B2BEe3d810eC9dAddbB205048bB29`.
+The incident centers on the following on-chain entities:
 
-### Vault and Oracle design
+- Vault: `0xb91ae2c8365fd45030aba84a4666c4db074e53e7`
+- Owner EOA (privileged signer): `0x27defcfa6498f957918f407ed8a58eba2884768c`
+- Main orchestrator contract: `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`
+- USDC token (FiatTokenV2_2): `0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48`
+- Shielding / L2-related contract: `0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9`
 
-`Vault.sol` manages vault state, reserves, and synthetic token issuance, delegating price discovery to `Oracle.sol`. Vault operations such as `initialize` and `mint` accept arbitrary ERC‑20 tokens as debt and collateral, subject only to the parameters supplied in the call. For vaultId 21 in this incident, the attacker chose:
+Contract `0xea55fffae1937e47eba2d854ab7bd29a9cc29170` stores a single owner address in storage slot `0` and exposes both an ERC20-like interface and a specialized entrypoint `cb01c553`. Extended semantics for this contract were reconstructed from bytecode and disassembly.
 
-- `debtToken = 0x341c853c09b3691b434781078572f9d3ab9e3cbb`
-- `collateralToken = 0xea55fffae1937e47eba2d854ab7bd29a9cc29170`
-- `leverageTier = 0`
-
-`Oracle.sol` computes prices for a pair `(tokenA, tokenB)` by:
-
-- Ordering them into `(token0, token1)`.
-- Probing Uniswap V3 pools for that pair across a base set of fee tiers and any configured extra tiers.
-- Selecting the fee tier whose average in-range liquidity (weighted by TWAP duration) yields the highest score.
-- Using the pool’s TWAP tick to derive a price, which is cached in oracle state.
-
-The oracle is deliberately permissionless: it will initialize and update state for any pair of ERC‑20 tokens, and it does not require that the assets be whitelisted or that liquidity be “organic” in any sense beyond existing on-chain.
-
-### Unrestricted collateral and decimals
-
-The protocol treats arbitrary ERC‑20 tokens as potential debt and collateral. In this incident:
-
-- `0x341c…` is a synthetic ERC‑20‑like debt token deployed by the attacker via the orchestrator.
-- `0xea55…` is an ERC‑20‑like token that also implements an orchestrator entrypoint (`0xcb01c553`) and is used as the collateral token.
-- The collateral token `0xea55…` reports `decimals() = 40`, implying extremely fine nominal precision compared to standard 18‑decimal tokens.
-
-The protocol’s USDC and WBTC reserves are held inside the Vault contract and are not directly transferable by arbitrary callers. They become exposed only when Vault operations such as `mint` use Oracle‑reported prices derived from Uniswap pools whose liquidity and pricing can be controlled by an attacker through newly minted synthetic tokens.
-
-## Vulnerability Analysis
-
-The root cause is a protocol‑level design bug in how the Vault and Oracle support permissionless listing and pricing of arbitrary ERC‑20 token pairs using Uniswap V3 TWAPs, without enforcing:
-
-- whitelisting or governance approval for new debt/collateral tokens,
-- quality checks on the provenance and age of Uniswap liquidity, and
-- protections against attacker‑controlled tokens with extreme decimals.
-
-### Vulnerable components
-
-1. **Vault.sol (0xb91a…) – listing and mint logic**
-
-   `Vault.sol` accepts user‑supplied `(debtToken, collateralToken, leverageTier)` parameters to define new vaults. In the exploit, the attacker calls:
-
-   ```solidity
-   // Vault.sol (simplified signatures, from artifacts/root_cause/data_collector/iter_1/contract/1/0xb91a.../source/src/Vault.sol)
-   function initialize(SirStructs.VaultParameters calldata vaultParams) external;
-
-   function mint(
-       bool isAPE,
-       SirStructs.VaultParameters memory vaultParams,
-       uint256 amountToDeposit,
-       uint144 collateralToDepositMin
-   ) external payable nonReentrant returns (uint256 amount);
-   ```
-
-   The implementation of `mint` (and its helper `_mint`) pulls price information from the Oracle and uses it, together with vault parameters and reserves, to determine how much APE/TEA to issue and how much collateral to accept. There is no requirement that `debtToken` or `collateralToken` be on a whitelist or backed by real assets.
-
-2. **Oracle.sol (0x3CDCCF…) – Uniswap‑based TWAP oracle**
-
-   `Oracle.sol` allows any caller to initialize oracle state for any pair of tokens and to update the corresponding price. The initialization logic (excerpted) is:
-
-   ```solidity
-   // Oracle.sol (from artifacts/root_cause/data_collector/iter_1/contract/1/0xb91a.../source/src/Oracle.sol)
-   function initialize(address tokenA, address tokenB) external {
-       unchecked {
-           (tokenA, tokenB) = _orderTokens(tokenA, tokenB);
-
-           SirStructs.OracleState memory oracleState = _state[tokenA][tokenB];
-           if (oracleState.initialized) return;
-
-           SirStructs.UniswapFeeTier[] memory uniswapFeeTiers = getUniswapFeeTiers();
-           uint256 numUniswapFeeTiers = uniswapFeeTiers.length;
-
-           uint256 score;
-           UniswapOracleData memory oracleData;
-           UniswapOracleData memory bestOracleData;
-           for (uint i = 0; i < numUniswapFeeTiers; ++i) {
-               oracleData = _uniswapOracleData(tokenA, tokenB, uniswapFeeTiers[i].fee);
-               emit UniswapOracleProbed(
-                   uniswapFeeTiers[i].fee,
-                   oracleData.aggPriceTick,
-                   oracleData.avLiquidity,
-                   oracleData.period,
-                   oracleData.cardinalityToIncrease
-               );
-
-               if (oracleData.avLiquidity > 0) {
-                   uint256 scoreTemp = _feeTierScore(
-                       uint256(oracleData.avLiquidity) * oracleData.period,
-                       uniswapFeeTiers[i]
-                   );
-
-                   if (scoreTemp > score) {
-                       oracleState.indexFeeTier = uint8(i);
-                       bestOracleData = oracleData;
-                       score = scoreTemp;
-                   }
-               }
-           }
-
-           if (score == 0) revert NoUniswapPool();
-           oracleState.indexFeeTierProbeNext = (oracleState.indexFeeTier + 1) % uint8(numUniswapFeeTiers);
-           oracleState.initialized = true;
-           oracleState.uniswapFeeTier = uniswapFeeTiers[oracleState.indexFeeTier];
-           oracleState.timeStampFeeTier = uint40(block.timestamp);
-
-           if (bestOracleData.cardinalityToIncrease > 0) {
-               bestOracleData.uniswapPool.increaseObservationCardinalityNext(bestOracleData.cardinalityToIncrease);
-           }
-
-           _state[tokenA][tokenB] = oracleState;
-
-           emit OracleInitialized(
-               tokenA,
-               tokenB,
-               oracleState.uniswapFeeTier.fee,
-               bestOracleData.avLiquidity,
-               bestOracleData.period
-           );
-       }
-   }
-   ```
-
-   The oracle selects the Uniswap pool with the highest liquidity‑weighted score, regardless of whether that liquidity is entirely supplied by a single attacker in a fresh pool.
-
-3. **Attacker‑controlled tokens and Uniswap pool**
-
-   The attacker deploys:
-
-   - `0x341c853c09b3691b434781078572f9d3ab9e3cbb` as an ERC‑20‑like debt token with owner‑controlled minting.
-   - `0xea55fffae1937e47eba2d854ab7bd29a9cc29170` as an ERC‑20‑like token and orchestrator with `decimals() = 40`.
-
-   These tokens form the pair used in a new Uniswap V3 pool (`0xE4C684F944b26b21167ef5a25F52311Ab7822831`, fee tier 100), whose price and liquidity are entirely determined by the attacker. Because the Oracle trusts this pool once it observes non‑zero liquidity, its TWAP tick can be manipulated to represent an arbitrarily large price ratio between `0x341c…` and `0xea55…`.
-
-### Exploit conditions (ACT opportunity)
-
-The exploit is an anyone‑can‑take (ACT) opportunity because it relies solely on:
-
-- deploying ERC‑20‑like contracts and interacting with public contracts (Vault, Oracle, Uniswap V3 factory/pool/NonfungiblePositionManager/Quoter, USDC, WBTC),
-- sending standard Ethereum L1 transactions from an unprivileged EOA under normal gas and consensus rules, and
-- using only canonical on‑chain data, logs, and traces.
-
-The necessary conditions are:
-
-1. An unprivileged EOA can deploy arbitrary ERC‑20‑like contracts (`0x341c…` and `0xea55…`) and use them as `debtToken` and `collateralToken` for a new vault without governance or whitelist checks.
-2. The Oracle is willing to initialize and update state for `(0x341c…, 0xea55…)` and to treat a newly created Uniswap V3 pool seeded entirely with attacker liquidity as a valid price source.
-3. `Vault.mint` accepts the Oracle‑reported price and the collateral token’s extreme `decimals()` (40 for `0xea55…`) without additional sanity checks, allowing a nominally huge synthetic collateral value to justify releasing real USDC and WBTC from the Vault.
-4. The protocol imposes no caps or external risk constraints that would block a single atomic transaction from creating the manipulated pool, binding it as an oracle, and minting against it to drain reserves.
-
-Under these conditions, any unprivileged adversary replicating the on‑chain sequence can realize the same profit, making the opportunity ACT rather than privileged or infrastructure‑specific.
-
-## Detailed Root Cause Analysis
-
-### Seed transaction structure and stages
-
-The exploit transaction `0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f` (chainid 1, block 22157900) is fully reconstructed in the stage‑annotated call tree:
-
-```text
-Seed transaction 0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f – stage-annotated call tree (summary)
-
-Stage 0 – Entry
-- EOA 0x27defcfa6498f957918f407ed8a58eba2884768c → 0xea55fffae1937e47eba2d854ab7bd29a9cc29170::cb01c553(Vault 0xb91ae2c8365fd45030aba84a4666c4db074e53e7, USDC, WBTC, WETH, config blob).
-
-Stage 1 – Deploy and seed attacker tokens
-- 0xea55… → CREATE → 0x341c853c09b3691b434781078572f9d3ab9E3CBB (ERC-20-like debt token).
-- 0xea55… → 0x341c…::mint(2e50) to 0xea55…, giving the orchestrator virtually unlimited 0x341c… balance.
-- 0x341c… → approve(Vault 0xb91a…, 2e50) and approve(NonfungiblePositionManager 0xC36442b4a4522E871399CD717aBDD847Ab11FE88, large amount).
-- 0xea55… (an ERC-20-like token) → approve(0xC364…, large amount) and approve(SwapRouter 0xE592427A0AEce92De3Edee1F18E0157C05861564, max uint256).
-
-Stage 2 – Uniswap V3 pool creation and liquidity
-- 0xea55… → UniswapV3Factory 0x1F98431c8aD98523631AE4a59f267346ea31F984::createPool(0x341c…, 0xea55…, fee 100) → new pool 0xE4C684F944b26b21167ef5a25F52311Ab7822831.
-- 0xea55… → UniswapV3Pool::initialize with an extreme sqrtPriceX96, fixing a highly skewed 0x341c…/0xea55… price.
-- 0xea55… → NonfungiblePositionManager 0xC364…::mint((0x341c…, 0xea55…, fee 100, lowerTick, upperTick, amount0, amount1, …)).
-```
-
-*(Source: artifacts/root_cause/data_collector/iter_2/tx/1/0xa05f…/call_tree_stage_summary.md.)*
-
-Later stages in the same call tree show:
-
-- Stage 3: Oracle probing via Uniswap V3 Quoter and `Vault.initialize`, which calls `Oracle.initialize` for `(0x341c…, 0xea55…)` and binds the manipulated pool as the oracle source.
-- Stage 4: `Vault.mint` with `isAPE = true` and a very large `debtAmount`, which invokes `Oracle.updateOracleState`, interacts with the manipulated pool via swaps, and emits a `Mint` event for `vaultId = 21`.
-- Stage 5: WBTC and USDC outflows from the Vault to attacker‑controlled addresses.
-
-### Attacker‑controlled tokens and decimals
-
-Semantic analysis of the attacker‑controlled tokens shows:
-
-```text
-Token 0x341c853c09b3691b434781078572f9d3ab9e3cbb – semantic summary
-
-- Exposes standard ERC-20 selectors (balanceOf, transfer, transferFrom, approve, totalSupply, name, symbol, decimals, allowance).
-- Includes a mint function invoked as 0x341c…::mint(2e50) immediately after deployment, minting an enormous supply directly to 0xea55….
-- Transfer/transferFrom behavior in the trace is standard and non-reentrant; there is no fee-on-transfer or rebasing effect in the observed paths.
-```
-
-*(Source: artifacts/root_cause/data_collector/iter_2/contract/1/0x341c…/semantic_summary.md.)*
-
-For the orchestrator/collateral token:
-
-```text
-Orchestrator 0xea55fffae1937e47eba2d854ab7bd29a9cc29170 – cb01c553 summary
-
-- Implements both an ERC-20-like token (used as collateral) and an orchestrator entrypoint 0xcb01c553.
-- cb01c553 orchestrates deployment and minting of 0x341c…, Uniswap pool creation and seeding for (0x341c…, 0xea55…), oracle initialization, vault initialization for (debtToken = 0x341c…, collateralToken = 0xea55…), and a leveraged Vault.mint that drains USDC and WBTC from the Vault to attacker-controlled addresses.
-- decimals() on 0xea55… returns 40, enabling extremely large nominal collateral valuations when combined with the manipulated Uniswap price.
-```
-
-*(Source: artifacts/root_cause/data_collector/iter_2/contract/1/0xea55…/semantic_summary_cb01c553.md.)*
-
-### Misuse of Uniswap oracle
-
-By creating a fresh Uniswap V3 pool `(0x341c…, 0xea55…)` and supplying all liquidity, the attacker ensures that:
-
-- The pool’s TWAP tick reflects the attacker’s chosen price ratio.
-- The pool’s average liquidity is high relative to any other pools for the pair (of which there are none), giving it the highest liquidity‑weighted score.
-
-When `Oracle.initialize` is called via `Vault.initialize`, the oracle:
-
-- probes all configured fee tiers for `(0x341c…, 0xea55…)`,
-- selects the attacker’s pool at fee tier 100 as the best tier, and
-- records this in `_state[token0][token1].uniswapFeeTier`.
-
-Later in the same transaction, `Vault.mint` calls `Oracle.updateOracleState`, which reads from this pool and updates `oracleState.tickPriceX42`. Vault minting logic then treats this price as authoritative when computing how much USDC and WBTC to release against the attacker’s synthetic position backed by `0xea55…` collateral.
-
-### Vault minting against fake collateral
-
-The `Vault.mint` implementation uses the oracle price and collateral parameters to compute the amount of synthetic APE/TEA to issue and the collateral to accept. For mints that involve Uniswap swaps, the vault uses `uniswapV3SwapCallback` to settle with the pool:
-
-```solidity
-function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
-    address uniswapPool;
-    assembly {
-        uniswapPool := tload(1)
-    }
-    require(msg.sender == uniswapPool);
-
-    (
-        address minter,
-        address ape,
-        SirStructs.VaultParameters memory vaultParams,
-        SirStructs.VaultState memory vaultState,
-        SirStructs.Reserves memory reserves,
-        bool zeroForOne,
-        bool isETH
-    ) = abi.decode(
-        data,
-        (address, address, SirStructs.VaultParameters, SirStructs.VaultState, SirStructs.Reserves, bool, bool)
-    );
-
-    (uint256 collateralToDeposit, uint256 debtTokenToSwap) = zeroForOne
-        ? (uint256(-amount1Delta), uint256(amount0Delta))
-        : (uint256(-amount0Delta), uint256(amount1Delta));
-
-    if (isETH) {
-        TransferHelper.safeTransfer(vaultParams.debtToken, uniswapPool, debtTokenToSwap);
-    }
-
-    require(collateralToDeposit <= type(uint144).max);
-    uint256 amount = _mint(minter, ape, vaultParams, uint144(collateralToDeposit), vaultState, reserves);
-
-    if (!isETH) {
-        TransferHelper.safeTransferFrom(vaultParams.debtToken, minter, uniswapPool, debtTokenToSwap);
-    }
-
-    assembly {
-        tstore(1, amount)
-    }
-}
-```
-
-*(Source: Vault.sol at artifacts/root_cause/data_collector/iter_1/contract/1/0xb91a…/source/src/Vault.sol.)*
-
-In the exploit, the vault treats `0xea55…` as high‑value collateral because:
-
-- the oracle price between `0x341c…` and `0xea55…` is attacker‑set via the manipulated pool, and
-- the collateral token’s `decimals() = 40` further amplifies nominal valuations.
-
-The result is that `Vault.mint` emits a large `Mint` event for `vaultId = 21` and proceeds to transfer real USDC and WBTC from its reserves to attacker‑controlled addresses, even though the underlying “collateral” is just cheaply minted synthetic tokens.
-
-### Concrete USDC balance diffs
-
-Balance diffs for the exploit transaction confirm the USDC movement:
+From the extended semantics summary:
 
 ```json
 {
-  "chainid": 1,
-  "txhash": "0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f",
+  "contract_address": "0xea55fffae1937e47eba2d854ab7bd29a9cc29170",
+  "access_control": {
+    "owner_storage_slot": 0,
+    "owner_address_source": "storage slot 0, masked to 160 bits and compared against tx.origin in cb01c553 handler.",
+    "cb01c553_access": {
+      "selector": "0xcb01c553",
+      "description": "Strong owner-only EOA gate: the function first loads an address from storage slot 0, masks to 160 bits, and requires tx.origin to equal this stored owner; it then separately requires msg.sender to equal tx.origin, so only the owner EOA (not contracts or proxies) can invoke cb01c553."
+    }
+  }
+}
+```
+
+This access-control structure makes `cb01c553` callable only by the single EOA recorded in slot `0`. In the seed transaction, that EOA is `0x27defcfa6498f957918f407ed8a58eba2884768c`.
+
+The pre-state for the incident is the Ethereum mainnet state immediately before block `22157900`, including balances, allowances, and contract storage for:
+
+- EOA `0x27defcfa6498f957918f407ed8a58eba2884768c`
+- Contract `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`
+- Vault `0xb91ae2c8365fd45030aba84a4666c4db074e53e7`
+- USDC contract `0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48`
+
+This pre-state is reconstructed from:
+
+- `artifacts/root_cause/seed/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/metadata.json`
+- `artifacts/root_cause/seed/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/balance_diff.json`
+- `artifacts/root_cause/data_collector/iter_1/address/1/0x27defcfa6498f957918f407ed8a58eba2884768c/txlist.json`
+- `artifacts/root_cause/data_collector/iter_4/address/1/0xb91ae2c8365fd45030aba84a4666c4db074e53e7/txlist.json`
+- `artifacts/root_cause/data_collector/iter_5/address/1/0xb91ae2c8365fd45030aba84a4666c4db074e53e7/erc20_transfers_etherscan_v2.json`
+
+USDC (`FiatTokenV2_2`) is implemented at layout address `0x43506849d7c04f9138d1a2050bbf3a0c054402dd`. The seed balance-diff attributes the USDC balance changes at the vault and owner EOA to this verified implementation.
+
+Vault `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` acts as a multi-depositor pool: ERC20 transfer logs show 310 transfers from 45 distinct senders between 20 Feb 2025 and 30 Mar 2025 UTC, with multiple EOAs depositing tokens into this address prior to the incident.
+
+## Vulnerability Analysis
+
+The core vulnerability is not a low-level bug such as arithmetic overflow or reentrancy; it is a governance and privilege-design issue:
+
+- Contract `0xea55fffae1937e47eba2d854ab7bd29a9cc29170` grants a single EOA (stored in storage slot `0`) unrestricted authority to orchestrate complex DeFi operations via `cb01c553`.
+- `cb01c553` is guarded only by checks that:
+  - `tx.origin` equals the stored owner address, and
+  - `msg.sender` equals `tx.origin`.
+- There is no share-based or depositor-based limitation on how much USDC can be withdrawn from vault `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` in a single owner call.
+- Downstream protocols (such as Uniswap V3’s `NonfungiblePositionManager` and the APE-related delegatecall target) enforce their own invariants, but do not tie withdrawals from the vault to individual depositor share balances.
+
+As summarized in the extended semantics:
+
+```json
+{
+  "cb01c553_semantics": {
+    "selector": "0xcb01c553",
+    "role": "seed vault entrypoint",
+    "withdrawal_conditions_for_vault_usdc": {
+      "who_can_trigger": "Only the owner EOA stored in slot 0, because cb01c553 enforces ORIGIN == stored_owner and CALLER == ORIGIN.",
+      "on_chain_checks_observed": [
+        "No additional check ties the amount withdrawn from 0xb91a… to any explicit per-user share balance or totalSupply constraint in this contract’s storage; all observable guards are owner/origin based, not depositor-balance based."
+      ]
+    },
+    "relationship_to_shares": "There is no clear mapping from a depositor’s share balance to a bounded withdrawal amount in the disassembly we inspected."
+  }
+}
+```
+
+This design means that once the owner keys are compromised or misused, all funds held at the vault can be unilaterally redirected by that owner, without any on-chain enforcement of depositor consent, multi-sig governance, or rate limits.
+
+Critically, the owner-only nature of the gate means the incident is not a permissionless ACT opportunity:
+
+- For any EOA other than the stored owner, the `ORIGIN == stored_owner` check fails and `cb01c553` reverts.
+- Even if an attacker deploys a contract that attempts to forward calls, the `CALLER == ORIGIN` check prevents successful execution via proxy contracts.
+- There is no alternative entrypoint in `0xea55fffae1937e47eba2d854ab7bd29a9cc29170` observed performing the same vault-draining transfer without these owner checks.
+
+## Detailed Root Cause Analysis
+
+### Pre-state and owner configuration
+
+Immediately before block `22157900` (pre-state σ_B):
+
+- Vault `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` holds exactly `17,814,862,676` minimal units of USDC, as recorded in `balance_diff.json`.
+- EOA `0x27defcfa6498f957918f407ed8a58eba2884768c` holds zero USDC at the same token contract.
+- Contract `0xea55fffae1937e47eba2d854ab7bd29a9cc29170` has storage slot `0` configured with an owner address; extended semantics show that this slot is used in owner checks for `cb01c553`.
+
+From the seed USDC balance diff:
+
+```json
+{
   "erc20_balance_deltas": [
     {
       "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
       "holder": "0xb91ae2c8365fd45030aba84a4666c4db074e53e7",
       "before": "17814862676",
       "after": "0",
-      "delta": "-17814862676",
-      "contract_name": "FiatTokenV2_2"
+      "delta": "-17814862676"
     },
     {
       "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
       "holder": "0x27defcfa6498f957918f407ed8a58eba2884768c",
       "before": "0",
       "after": "17814862676",
-      "delta": "17814862676",
-      "contract_name": "FiatTokenV2_2"
+      "delta": "17814862676"
     }
   ]
 }
 ```
 
-*(Source: artifacts/root_cause/data_collector/iter_1/tx/1/0xa05f…/balance_diff_enriched.json.)*
+This shows that the entire USDC balance at the vault is about to be moved to the owner EOA in the incident transaction.
 
-This shows:
+### Execution of cb01c553 in the seed transaction
 
-- Vault `0xb91a…` loses 17,814,862,676 USDC units (17,814,862.676 USDC).
-- Attacker EOA `0x27defc…` gains the same amount.
+The seed trace for transaction `0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f` confirms that the call is made directly from the owner EOA to contract `0xea55fffae1937e47eba2d854ab7bd29a9cc29170` with selector `0xcb01c553`:
 
-Gas for the exploit transaction costs exactly 0.025754539 ETH at a gas price of 1 gwei. Under a conservative upper bound of 5,000 USDC per ETH, the gas cost is at most 130,000 USDC‑equivalent, well below 1% of the USDC gain and not enough to change the sign of the net profit.
-
-### Concrete USDC transfer window (exploit and routing)
-
-The USDC transfer window for the attacker EOA confirms two key movements:
-
-```json
-{
-  "status": "1",
-  "message": "OK",
-  "result": [
-    {
-      "blockNumber": "22157900",
-      "hash": "0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f",
-      "from": "0x00000000001271551295307acc16ba1e7e0d4281",
-      "to": "0x27defcfa6498f957918f407ed8a58eba2884768c",
-      "value": "17814862676"
-    },
-    {
-      "blockNumber": "22157929",
-      "hash": "0xaa52054c88c246e2a140459a0f47ec9ada469aa9e153a531dd788e5502709e27",
-      "from": "0x27defcfa6498f957918f407ed8a58eba2884768c",
-      "to": "0x00c600b30fb0400701010f4b080409018b9006e0",
-      "value": "17814862676"
-    }
-  ]
-}
+```bash
+Traces:
+  [25905063] 0xeA55fFFAe1937E47eBA2D854ab7bd29a9CC29170::cb01c553(000000000000000000000000b91ae2c8365fd45030aba84a4666c4db074e53e7...)
 ```
 
-*(Source: artifacts/root_cause/data_collector/iter_2/address/1/0x27defc…/usdc_tokentx_window_v2.json.)*
+Within this handler, as summarized in the extended semantics:
 
-Within the valuation window [22151900, 22157900] before the exploit, USDC logs for `0x27defc…` show no prior USDC transfers, so the attacker’s USDC balance in that window is 0. Immediately after the exploit transaction, the attacker holds 17,814,862.676 USDC, which is then moved out in `0xaa5205…` to a router contract. There is no evidence in this block window of USDC being returned to the Vault or protocol.
+- The contract loads storage slot `0`, masks it to a 160-bit address, and compares it against `ORIGIN`; if they differ, execution reverts.
+- It then checks that `CALLER` equals `ORIGIN`, ensuring that the call originates directly from the EOA rather than any intermediate contract.
 
-### Profit predicate (ACT success condition)
+Because this transaction is sent directly from `0x27defcfa6498f957918f407ed8a58eba2884768c` to `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`, we have:
 
-The ACT opportunity is evaluated under a profit predicate with reference asset USDC:
+- `tx.origin = 0x27defcfa6498f957918f407ed8a58eba2884768c`
+- `msg.sender = 0x27defcfa6498f957918f407ed8a58eba2884768c`
 
-- **Reference asset:** USDC (`0xa0b8…`).
-- **Adversary address:** `0x27defcfa6498f957918f407ed8a58eba2884768c`.
-- **Value before (in USDC):** 0 USDC for the attacker EOA within the valuation scope [22151900, 22157900] before the exploit transaction, as shown by the absence of prior USDC tokentx entries.
-- **Value after (in USDC):** 17,814,862.676 USDC immediately after the exploit transaction, per `balance_diff_enriched.json` and the first USDC transfer in the tokentx window.
-- **Fees paid (in USDC‑equivalent):** at most 130,000 USDC‑equivalent, assuming ETH price at block 22157900 does not exceed 5,000 USDC per ETH and using the exact gas cost (0.025754539 ETH).
-- **Delta:** 17,814,862.676 USDC gain from the exploit transaction alone; even after subtracting the upper‑bounded gas cost, the net change remains strictly positive and on the order of 1.78e7 USDC.
+and these values match the stored owner address in slot `0`, so the gate passes.
 
-Other tokens controlled by the attacker (e.g., `0x341c…`, `0xea55…`, any residual WBTC) are excluded from this valuation; their inclusion would only increase net profit if priced, and their exclusion keeps the predicate conservative.
+### Vault withdrawal mechanism
+
+After satisfying the owner-only gate, `cb01c553` performs a series of actions:
+
+- Deploys a new ERC20-like token (observed at `0x341c853c09b3691b434781078572f9d3ab9e3cbb`) via `CREATE`.
+- Configures the new token with an initialization call.
+- Sets ERC20 approvals (using `approve(address,uint256)`) to external DeFi contracts, including:
+  - Uniswap V3 `NonfungiblePositionManager` at `0xc36442b4a4522e871399cd717abdd847ab11fe88`
+  - Other aggregator/router addresses passed via calldata.
+- Interacts with Uniswap V3 and other protocols to move USDC from vault address `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` into complex positions and ultimately into the owner EOA.
+
+The key invariant break is that this multi-step procedure transfers all USDC from the vault to the owner EOA without any on-chain check tying the withdrawn amount to depositor share balances:
+
+- Vault USDC balance decreases from `17,814,862,676` units to `0`.
+- Owner EOA USDC balance increases from `0` to `17,814,862,676` units.
+- No per-user accounting or governance mechanism is enforced in the observed bytecode paths to restrict this transfer.
+
+The root cause can therefore be stated precisely:
+
+- **Design flaw:** On-chain logic relies solely on a single EOA owner gate (`slot 0` + `ORIGIN`/`CALLER` equality) to protect a multi-depositor vault, with no on-chain enforcement of share-based withdrawal limits or multi-sig governance.
+- **Incident realization:** The privileged owner EOA used this gate to execute `cb01c553`, which orchestrated a full vault drain from `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` to the owner’s own address.
 
 ## Adversary Flow Analysis
 
-### Adversary cluster and victim contracts
+Although there is no unprivileged adversary in the ACT sense, we can still describe the observed flow of the privileged actor (owner EOA) across transactions.
 
-The adversary cluster consists of:
+### Seed vault-drain transaction
 
-- **EOA (attacker):** `0x27defcfa6498f957918f407ed8a58eba2884768c`  
-  Originator of exploit tx `0xa05f…` and follow‑up tx `0xaa5205…`, deployer of the orchestrator contract `0xea55…`, and recipient of the drained USDC before routing funds onward.
+- Transaction: `0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f`
+- Chain: Ethereum mainnet (`chainid = 1`)
+- Role: Seed / primary incident transaction
+- From: `0x27defcfa6498f957918f407ed8a58eba2884768c` (owner EOA)
+- To: `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`
+- Function: `cb01c553`
 
-- **Orchestrator/collateral token:** `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`  
-  Unverified contract deployed by the attacker that implements both an ERC‑20‑like token and the orchestrator entrypoint `0xcb01c553`. Used as the collateral token in vaultId 21 and as one leg of the manipulated Uniswap V3 pool.
+Effect (from root cause and balance-diff evidence):
 
-- **Synthetic debt token:** `0x341c853c09b3691b434781078572f9d3ab9e3cbb`  
-  Unverified ERC‑20‑like token deployed via `CREATE` from `0xea55…` in the exploit transaction; minted in enormous quantities to `0xea55…` and used as debt token and Uniswap token0.
+- The owner EOA invokes `cb01c553`, passes the `ORIGIN`/`CALLER` checks, and triggers a complex flow that moves `17,814,862,676` units of USDC from vault `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` to the owner EOA.
+- ERC20 balance diffs confirm the exact pre- and post-state for USDC at both the vault and owner addresses.
 
-Victim protocol contracts include:
+### Post-withdrawal swaps and shielding
 
-- **SIR Vault singleton:** `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` (verified)  
-  Holds USDC and WBTC reserves and manages leveraged vaults, including vaultId 21.
+After receiving USDC from the vault, the owner EOA performs follow-up transactions:
 
-- **SIR Oracle:** `0x3CDCCFA37c1B2BEe3d810eC9dAddbB205048bB29` (verified)  
-  Provides Uniswap‑based TWAP prices to the Vault.
+- Transaction: `0xd3eeb91e4dbd88d54510cfa0d96747370dc39bb97d6041174d452a49b7e2a2bb`
+  - From: `0x27defcfa6498f957918f407ed8a58eba2884768c`
+  - To: `0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9`
+  - Function: `shield(tuple[] _shieldRequests)`
+  - Role: Post-withdrawal shielding of part of the withdrawn value.
 
-### Lifecycle stages
+From the owner EOA txlist:
 
-1. **Stage 1 – Orchestrator deployment by attacker EOA**
+```json
+{
+  "hash": "0xd3eeb91e4dbd88d54510cfa0d96747370dc39bb97d6041174d452a49b7e2a2bb",
+  "from": "0x27defcfa6498f957918f407ed8a58eba2884768c",
+  "to": "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9",
+  "methodId": "0x044a40c3",
+  "functionName": "shield(tuple[] _shieldRequests)"
+}
+```
 
-   - **Tx:** `0xa0b04f968ddafd059bee3f97c2f1af9b77ef41a4c402486985dd6c424c579291` (block 22157887)  
-   - **Mechanism:** contract deployment.  
-   - **Effect:** EOA `0x27defc…` deploys `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`, which will later coordinate the exploit.  
-   - **Evidence:** attacker txlist and `0xea55…` disassembly and semantic summary.
+Balance diffs and tx metadata for this shielding transaction show that part of the withdrawn value is routed into the shielding or L2-related contract, reducing traceability of the withdrawn USDC.
 
-2. **Stage 2 – Synthetic debt token deployment and Uniswap pool creation**
+Throughout this flow:
 
-   - **Tx:** `0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f` (block 22157900)  
-   - **Mechanism:** deployment and liquidity provisioning.  
-   - **Effect:** Within `0xa05f…`, `0xea55…` deploys `0x341c…`, mints an enormous supply to itself, approves Vault and NonfungiblePositionManager, and creates a new Uniswap V3 pool `0xE4C684F9…` for `(0x341c…, 0xea55…)` at fee tier 100, seeding it entirely with attacker‑controlled liquidity.  
-   - **Evidence:** `trace.cast.log`, `call_tree_stage_summary.md`, and `0x341c…` semantic summary.
-
-3. **Stage 3 – Vault and oracle initialization and leveraged mint**
-
-   - **Tx:** `0xa05f…` (same as Stage 2)  
-   - **Mechanism:** oracle binding and mint.  
-   - **Effect:** `0xea55…` calls `Vault.initialize` with `(debtToken = 0x341c…, collateralToken = 0xea55…, leverageTier = 0)`. Vault delegates to `Oracle.initialize`, which probes fee tiers and selects the attacker’s pool as the price source. Later in the transaction, `Vault.mint(true, vaultParams, debtAmount ≈ 1.396e35, minShares = 1)` calls `Oracle.updateOracleState` to read the manipulated TWAP and uses it, together with `decimals(0xea55…) = 40`, to mint against the synthetic position, causing Vault to transfer 17,814,862,676 USDC units and 140,852,920 WBTC units from its reserves to attacker‑controlled addresses.  
-   - **Evidence:** verified `Vault.sol` and `Oracle.sol` source, `call_tree_stage_summary.md`, and `balance_diff_enriched.json`.
-
-4. **Stage 4 – Profit realization and USDC routing**
-
-   - **Tx:** `0xaa52054c88c246e2a140459a0f47ec9ada469aa9e153a531dd788e5502709e27` (block 22157929)  
-   - **Mechanism:** swap.  
-   - **Effect:** After the exploit, the attacker EOA holds 17,814,862.676 USDC. In `0xaa5205…`, the attacker sends this entire amount to router `0x00c600b30fb0400701010f4b080409018b9006e0` via `swapExactAmountIn`, demonstrating full control over the drained funds and completing immediate profit realization. No USDC is returned to the Vault in this window.  
-   - **Evidence:** USDC tokentx window and summary for `0x27defc…`.
-
-### ACT classification
-
-The flow uses only standard Ethereum features:
-
-- No privileged roles or admin keys are required.
-- No private relays, off‑chain agreements, or chain‑specific quirks are needed.
-- All components (Vault, Oracle, Uniswap V3, USDC, WBTC) are public contracts; the attacker’s own contracts are deployed in‑tx using standard opcodes.
-
-Therefore the exploit opportunity is **ACT (anyone‑can‑take)**, realizable by any unprivileged EOA that replicates the on‑chain sequence using canonical contract addresses and standard RPC access.
+- The same EOA `0x27defcfa6498f957918f407ed8a58eba2884768c` is the initiator of the vault-drain transaction and subsequent swaps/shielding.
+- No other EOA or contract is observed gaining equivalent control over the vault’s funds without the owner-only gate.
 
 ## Impact & Losses
 
-### Token‑level losses
+### Quantitative impact
 
-From the enriched balance diffs and ERC‑20 transfer logs:
+The incident’s direct token-level impact is:
 
-- **USDC loss:**
-  - Vault `0xb91a…` USDC balance decreases from 17,814,862,676 units to 0, a delta of `-17,814,862,676` (17,814,862.676 USDC).
-  - Attacker EOA `0x27defc…` USDC balance increases from 0 to 17,814,862,676 units in the same transaction.
-  - These movements are recorded in `balance_diff_enriched.json` and the ERC‑20 USDC logs for transaction `0xa05f…`.
+- Token: USDC (`FiatTokenV2_2`, `0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48`)
+- Vault address: `0xb91ae2c8365fd45030aba84a4666c4db074e53e7`
+- Owner EOA: `0x27defcfa6498f957918f407ed8a58eba2884768c`
 
-- **WBTC loss:**
-  - Approximately 1.40852920 WBTC (140,852,920 satoshis) moves from Vault `0xb91a…` to `0xea55…` and onward to the attacker, as indicated by WBTC transfers in the seed balance diffs and the stage‑annotated call tree.
+From the USDC balance diffs in the seed transaction:
 
-### Protocol‑level impact
+- Vault USDC balance: `before = 17,814,862,676` units, `after = 0`, `delta = -17,814,862,676`
+- Owner EOA USDC balance: `before = 0` units, `after = 17,814,862,676`, `delta = +17,814,862,676`
 
-The direct on‑chain impact is:
+Using USDC’s 6-decimal format, this corresponds to:
 
-- A reduction of at least **17.8 million USDC** and approximately **1.41 WBTC** from Vault `0xb91a…` reserves to an adversary‑controlled cluster, with no compensating inflows observed in the incident window.
+- `17,814,862,676` minimal units = `17,814.862676` USDC tokens.
 
-Because both the debt and collateral backing vaultId 21 are attacker‑created synthetic tokens (`0x341c…` and `0xea55…`) with no intrinsic value, the liabilities of this vault configuration to external USDC and WBTC holders are no longer supported by real assets. This creates an insolvency exposure for the affected vault and undermines trust in the protocol’s oracle design and collateral onboarding process.
+The loss summary in `root_cause.json` encodes this as:
+
+- Total loss overview: USDC amount `"17814862.676"` (a decimal representation of the same underlying movement, expressed at token precision rather than raw minimal units).
+
+### Multi-depositor impact
+
+ERC20 transfer logs for the vault address show:
+
+- 310 token transfer events involving the vault.
+- 45 distinct sending addresses.
+- Activity spanning from 20 Feb 2025 to 30 Mar 2025 UTC.
+
+This confirms that:
+
+- Many independent EOAs deposited tokens into vault `0xb91ae2c8365fd45030aba84a4666c4db074e53e7` before the incident.
+- The owner-only withdrawal converts this multi-depositor pool into funds held solely by the owner EOA, without any on-chain mechanism ensuring proportional treatment or consent of the depositors.
+
+### Valuation notes
+
+The analysis explicitly does not convert the token-level loss or gas fees into a specific USD valuation:
+
+- Reference asset: USD
+- Adversary address: `0x27defcfa6498f957918f407ed8a58eba2884768c`
+- `value_before_in_reference_asset`, `value_after_in_reference_asset`, and `value_delta_in_reference_asset` are marked as `not_evaluated`.
+- Instead, the analysis relies on deterministic ERC20 balance diffs to quantify the incident in USDC units.
 
 ## References
 
-Key artifacts and references supporting this analysis:
+Key artifacts and on-chain data supporting this analysis:
 
-- **[1] Seed transaction metadata**  
-  `artifacts/root_cause/seed/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/metadata.json`
+1. Seed transaction metadata for `0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f`  
+   - `artifacts/root_cause/seed/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/metadata.json`
 
-- **[2] Seed transaction Foundry trace**  
-  `artifacts/root_cause/seed/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/trace.cast.log`
+2. Seed transaction trace and USDC balance diffs  
+   - Trace (cast run -vvvvv style):  
+     `artifacts/root_cause/seed/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/trace.cast.log`
+   - USDC balance diffs:  
+     `artifacts/root_cause/seed/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/balance_diff.json`
 
-- **[3] Stage‑annotated exploit call tree**  
-  `artifacts/root_cause/data_collector/iter_2/tx/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7c091e7b4e38cee86f1335736f/call_tree_stage_summary.md`
+3. Extended semantics summary for contract `0xea55fffae1937e47eba2d854ab7bd29a9cc29170`  
+   - `artifacts/root_cause/data_collector/iter_4/contract/1/0xea55fffae1937e47eba2d854ab7bd29a9cc29170/extended_semantics_summary.json`
 
-- **[4] Vault.sol source (victim vault implementation)**  
-  `artifacts/root_cause/data_collector/iter_1/contract/1/0xb91ae2c8365fd45030aba84a4666c4db074e53e7/source/src/Vault.sol`
+4. Vault transaction history and ERC20 deposits  
+   - Vault txlist:  
+     `artifacts/root_cause/data_collector/iter_4/address/1/0xb91ae2c8365fd45030aba84a4666c4db074e53e7/txlist.json`
+   - Vault ERC20 transfers (Etherscan v2):  
+     `artifacts/root_cause/data_collector/iter_5/address/1/0xb91ae2c8365fd45030aba84a4666c4db074e53e7/erc20_transfers_etherscan_v2.json`
 
-- **[5] Oracle.sol source (Uniswap‑based price oracle)**  
-  `artifacts/root_cause/data_collector/iter_1/contract/1/0xb91ae2c8365fd45030aba84a4666c4db074e53e7/source/src/Oracle.sol`
+5. Owner EOA transaction history, including swaps and shielding  
+   - `artifacts/root_cause/data_collector/iter_1/address/1/0x27defcfa6498f957918f407ed8a58eba2884768c/txlist.json`
 
-- **[6] Semantic summary of debt token 0x341c…**  
-  `artifacts/root_cause/data_collector/iter_2/contract/1/0x341c853c09b3691b434781078572f9d3ab9e3cbb/semantic_summary.md`
+These artifacts collectively demonstrate that:
 
-- **[7] Semantic summary of orchestrator/collateral token 0xea55… (cb01c553 entrypoint)**  
-  `artifacts/root_cause/data_collector/iter_2/contract/1/0xea55fffae1937e47eba2d854ab7bd29a9cc29170/semantic_summary_cb01c553.md`
-
-- **[8] Enriched balance diff for exploit transaction**  
-  `artifacts/root_cause/data_collector/iter_1/tx/1/0xa05f047ddfdad9126624c4496b5d4a59f961ee7b4e38cee86f1335736f/balance_diff_enriched.json`
-
-- **[9] USDC ERC‑20 transfer window for attacker EOA**  
-  `artifacts/root_cause/data_collector/iter_2/address/1/0x27defcfa6498f957918f407ed8a58eba2884768c/usdc_tokentx_window_v2.json`
+- The vault-drain transaction is an owner-signed call to a strictly owner-gated entrypoint.
+- The entire USDC balance at the vault is transferred to the owner EOA in that transaction.
+- Subsequent owner transactions route portions of the withdrawn value through swaps and shielding.
 

