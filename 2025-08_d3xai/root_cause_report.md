@@ -1,220 +1,243 @@
-# BSC-56 BEP20USDT Proxy-Cluster Drain via Accounting Bug
+# BSC USDT Vault / Anti-Flashloan Token Flashloan Exploit (tx 0x26bcefc1…)
 
-## 1. Incident Overview TL;DR
+## Incident Overview TL;DR
 
-On BSC chain 56, EOA `0x4B63C0cf524F71847ea05B59F3077A224d922e8D` executed a two-transaction ACT-style exploit against the BEP20USDT proxy-cluster `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99` / `0x2Cc8B879E3663d8126fe15daDaaA6Ca8D964BbBE`.  
-Both transactions were sent to router-like contract `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C` and used helper contracts `0xCAC261d08Cc190eA2BF271aaB40cf21EbCb30cbA`, `0x6Ac39F58d3192CbBB4167BA3b559287D231eeBC7`, and `0x4D85f6AF054A2271a15F8D3cF880Ba7b7497225F`, plus upgradeable proxies delegating to implementation `0x1a1a84b45d2fEeeC1B1726F5C1da7d3fe2f37041`, to execute a flash-loan-based drain of BEP20USDT.  
-The root cause is a protocol-level accounting bug: the proxy-cluster allows BEP20USDT to be pulled out via delegatecalls and helpers without a corresponding reduction in the proxies’ recorded liabilities, breaking alignment between on-chain token balances and internal accounting.  
-The analyzer correctly classifies this as an ACT (`is_act = true`) protocol bug (`root_cause_category = "protocol_bug"`), realized purely from public on-chain state, verified contract code/disassemblies, and observable transactions.
+- Chain and protocol: BNB Smart Chain (chainid 56), custom USDT vault and anti-flashloan token stack composed of two TransparentUpgradeableProxy contracts and associated implementations, plus Pancake-style AMMs and a PancakeV3Pool.
+- Classification: ACT (anyone-can-take) opportunity and protocol_bug — the live configuration at block 57,780,985 embeds a same-block “Flash loan protection: cannot sell in the same block of purchase.” invariant that fails to prevent the observed flashloan-driven, same-block buy-and-sell route.
+- Core event: EOA `0x4b63c0cf524f71847ea05b59f3077a224d922e8d` sends a single legacy type‑0 transaction `0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f` to orchestrator contract `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C`, which takes a large USDT flashloan from PancakeV3Pool `0x92b7807bF19b7DDdf89b706143896d05228f3121`, routes value through a proxy-based USDT vault and anti-flashloan token plus a USDT–proxy AMM pair, repays the flashloan, and leaves the attacker’s EOA with a large net BNB profit funded by WBNB and vault-held USDT.
+- Deterministic profit: From the pre-state σ_B immediately before including block 57,780,985, replaying the exact calldata, gas and value for tx `0x26bcefc1…` deterministically yields a net BNB portfolio increase of `190.252041814831167874` BNB for the attacker EOA while fully repaying the USDT flashloan.
 
-## 2. Key Background
+## Key Background
 
-- BEP20USDT at `0x55d398326f99059fF775485246999027B3197955` is a standard BEP20 stablecoin on BSC, and WBNB at `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c` wraps BNB; both have verified sources in the seed artifacts.  
-- Router-like contract `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C` orchestrates:
-  - Flash loans from Pancake V3 pool `0x92b7807bF19b7DDdf89b706143896d05228f3121`.  
-  - Swaps via PancakeRouter `0x10ED43C718714eb63d5aA57B78B54704E256024E`.  
-  - Calls into helper contracts `0xCAC261…`, `0x6Ac39…`, and `0x4D85f6AF…`, which delegatecall into implementation `0x4beefd0F0064Cb8FAF045B989976A453ae983Da6` to perform ERC20 `transferFrom` operations.  
-- Upgradeable proxies `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99` and `0x2Cc8B879E3663d8126fe15daDaaA6Ca8D964BbBE` on chain 56 delegatecall into implementation `0x1a1a84b45d2fEeeC1B1726F5C1da7d3fe2f37041`.  
-  - Disassembly for `0x1a1a84b4…` shows a dispatcher for standard ERC20 functions and custom accounting methods that read/write storage via `KECCAK256`-based mappings, implementing an internal liability/position ledger on top of BEP20USDT balances held by the proxies.  
-- Pancake V3 pool `0x92b7807bF19b7DDdf89b706143896d05228f3121` and pair `0x16b9a82891338f9Ba80E2D6970FddA79D1eb0daE` provide BEP20USDT–WBNB liquidity.  
-  - Verified sources under `artifacts/root_cause/data_collector/iter_1/contract/56/` confirm standard AMM behavior and no protocol-side special-casing for these addresses.
+- System composition: The exploit path combines standard BSC infrastructure with custom components:
+  - BEP20USDT token `0x55d398326f99059ff775485246999027b3197955`.
+  - Wrapped BNB (WBNB) `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`.
+  - PancakeV3Pool-like flashloan pool `0x92b7807bF19b7DDdf89b706143896d05228f3121`.
+  - PancakePair-like AMM (USDT–proxy pair) `0xaec58FBd7Ed8008A3742f6d4FFAA9F4B0ECbc30e`.
+  - Two TransparentUpgradeableProxy contracts:
+    - Custom token proxy `0x2Cc8B879E3663d8126fe15daDaaA6Ca8D964BbBE` over implementation `0x13b5ca6642d9c2309b4c34f8b591e35b629458fc`.
+    - USDT vault proxy `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99` over implementation `0x89a0af274e6244f781a50d632b222231ef7655eb`.
+  - Router/pricing contract `0x94DDCd7253AC864Ec77A2dDC2bE4B2418Ed17C9D` and implementation `0x1a1a84b45d2fEeeC1B1726F5C1da7d3fe2f37041` that compute prices and execute exchanges used in the exploit route.
+- Embedded anti-flashloan invariant: Decompiled implementations `0x13b5ca6642d9c2309b4c34f8b591e35b629458fc` and `0x1a1a84b45d2fEeeC1B1726F5C1da7d3fe2f37041` both:
+  - Maintain per-address, block-number-related storage (for example via mappings such as `storage_map_a[...]`).
+  - Contain multiple `require` statements that embed the revert string:
 
-## 3. Vulnerability Analysis
-
-The ACT opportunity arises because the BEP20USDT proxy-cluster (`0xb8ad82c4…` / `0x2Cc8B8…`) with implementation `0x1a1a84b4…` allows helper contracts and router `0x3b3E1E…` to move a large BEP20USDT balance out of proxy `0xb8ad82c4…` and into AMM pools while the proxy’s delegated storage in `0x1a1a84b4…` does not decrease a corresponding liability or supply-like variable.  
-This breaks the invariant that external token balances on BEP20USDT and internal accounting in the proxy implementation must remain aligned.
-
-**Vulnerable components**
-
-- BSC-56 upgradeable proxy `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99`, delegating to implementation `0x1a1a84b45d2fEeeC1B1726F5C1da7d3fe2f37041`, holding BEP20USDT and exposing accounting functions used during exploit transaction `0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f`.  
-- BSC-56 upgradeable proxy `0x2Cc8B879E3663d8126fe15daDaaA6Ca8D964BbBE`, also delegating to `0x1a1a84b4…` and participating in the same accounting scheme.  
-- Helper contracts `0xCAC261d08Cc190eA2BF271aaB40cf21EbCb30cbA`, `0x6Ac39F58d3192CbBB4167BA3b559287D231eeBC7`, and `0x4D85f6AF054A2271a15F8D3cF880Ba7b7497225F` plus implementation `0x4beefd0F0064Cb8FAF045B989976A453ae983Da6`, providing generalized ERC20 `transferFrom` and swap sequencing used to extract BEP20USDT from the proxy-cluster.  
-- Router-like contract `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C`, which coordinates helpers, proxies, PancakeRouter, and AMM pools during both preparation and exploit transactions.
-
-**Security principles violated**
-
-- **Alignment between external token balances and internal accounting**: the proxy implementation fails to ensure that internal liabilities or share-like variables are reduced when BEP20USDT is transferred out of `0xb8ad82c4…`.  
-- **Invariant preservation across delegatecall-based architectures**: the combination of proxies, implementation `0x1a1a84b4…`, router `0x3b3E1E…`, and helper contracts lets delegatecall sequences alter external token balances while leaving delegated storage inconsistent.  
-- **Least-privilege use of ERC20 approvals**: generalized helpers that can `transferFrom` arbitrary callers to arbitrary recipients are granted approvals that, together with the flawed accounting scheme, allow adversarial sequences to drain tokens from the proxy-cluster.
-
-## 4. Detailed Root Cause Analysis
-
-### 4.1 On-chain pre-state and ACT opportunity
-
-- The relevant ACT pre-state `σ_B` is at BSC block `57780130` (and the later exploit block `57780985`), defined as the publicly reconstructible chain state immediately before:
-  - Transaction `0x27baa4c57686fb256aadecf3990cd750195a9cf7b778b908a4d9bbda091847e7` in block `57780130`, and  
-  - Transaction `0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f` in block `57780985`.  
-- This state is derived from:
-  - Etherscan transaction metadata.  
-  - QuickNode prestateTracer state diffs for both transactions.  
-  - BEP20USDT and WBNB verified token sources.  
-  - Verified sources or disassemblies for the involved router, proxies, implementation contracts, and helpers.  
-- Evidence for this reconstruction includes:
-  - `artifacts/root_cause/seed/56/0x26bcefc1…/metadata.json` and `balance_diff.json`.  
-  - PrestateTracer diffs and raw state-diff logs under `artifacts/root_cause/data_collector/iter_1/` and `iter_3/tx/56/*`.  
-  - Contract sources and disassemblies under `artifacts/root_cause/data_collector/iter_1/contract/56/` and `iter_2/contract/56/`.  
-  - Address-level txlists for the proxies and helper/router contracts.
-
-Within this pre-state, the proxies hold large BEP20USDT balances, helper contracts and router are deployed and callable, and AMM pools contain sufficient liquidity to support the observed flash loan and swaps. No privileged configuration or off-chain secret is required; the exploit is realizable by any unprivileged actor with access to public RPC and explorer data.
-
-### 4.2 Victim transaction and storage behavior
-
-The seed exploit transaction is:
-
-- Chain: `BSC (56)`  
-- Tx hash: `0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f`  
-- Role: `seed` (primary exploit)  
-
-Core effects (from `balance_diff_prestate_tracer.json` and `state_diff_prestateTracer_raw.json`):
-
-- A flash loan of `20,000,000` BEP20USDT is taken from pool `0x92b7807bF19b7DDdf89b706143896d05228f3121`.  
-- The borrowed USDT is routed through:
-  - Helpers `0xCAC261…` and `0x6Ac39…` (delegatecalling `0x4beefd0F…`).  
-  - Proxies `0xb8ad82c4…` and `0x2Cc8B8…` (delegating to `0x1a1a84b4…`).  
-  - PancakeRouter `0x10ED43C7…`.  
-  - AMM pools `0xaec58FBd7Ed8008A3742f6d4FFAA9F4B0ECbc30e` and `0x16b9a82891338f9Ba80E2D6970FddA79D1eb0daE`.  
-- BEP20USDT balance deltas include:
-  - `-239,832,087.664667062923384` units for proxy `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99`.  
-  - Matching positive deltas for `0x92b7807b…`, AMM participants `0xaec58FBd7Ed8008A3742f6d4FFAA9F4B0ECbc30e`, `0x13342140a62cb51c052b5a70eb186f40a1725ebf`, and `0x16b9a82891338f9Ba80E2D6970FddA79D1eb0daE`.  
-- `state_diff_prestateTracer_raw.json` shows storage updates for `0x16b9a828…` and `0x2Cc8B8…` but **no storage entry** for `0xb8ad82c4…`, even though its BEP20USDT balance on the token contract is reduced by `239,832,087.664667062923384` units.
-
-This directly demonstrates that the underlying token ledger for BEP20USDT changes while the proxy’s delegated storage in `0x1a1a84b4…` remains unchanged, leaving the proxy economically undercollateralized.
-
-### 4.3 Helper implementation behavior
-
-Disassembly for helper implementation `0x4beefd0F0064Cb8FAF045B989976A453ae983Da6` shows a dispatcher keyed on selector `0xe09618e9`, which constructs and executes ERC20 `transferFrom`-style calls when invoked via delegatecall from helper contracts:
-
-```text
-00000000: PUSH1 0x80
-00000002: PUSH1 0x40
-00000004: MSTORE
-00000005: CALLVALUE
-00000006: DUP1
-00000007: ISZERO
-00000008: PUSH2 0x000f
-0000000b: JUMPI
-0000000c: PUSH0
-0000000d: DUP1
-0000000e: REVERT
-0000000f: JUMPDEST
-00000010: POP
-00000011: PUSH1 0x04
-00000013: CALLDATASIZE
-00000014: LT
-00000015: PUSH2 0x0029
-00000018: JUMPI
-00000019: PUSH0
-0000001a: CALLDATALOAD
-0000001b: PUSH1 0xe0
-0000001d: SHR
-0000001e: DUP1
-0000001f: PUSH4 0xe09618e9
-00000024: EQ
-00000025: PUSH2 0x002d
-00000028: JUMPI
+```solidity
+require(storage_map_a[var_a] < block.number, "Flash loan protection: cannot sell in the same block of purchase.");
 ```
 
-Helper contracts `0xCAC261…`, `0x6Ac39…`, and `0x4D85f6AF…` delegatecall into this implementation, enabling flexible `transferFrom`-based extraction of BEP20USDT from callers such as the proxies and router into AMM pools and profit-taking addresses.
+  - These branches implement a same-block trading restriction for certain transfer paths involving the proxy token and vault.
+- Evidence of value shifts: Balance and state diffs for the exploit transaction (from `balance_diff.json` and `balance_diff_prestateTracer.json`) show:
+  - The USDT flashloan principal to pool `0x92b7…` is repaid with fee.
+  - Attacker EOA `0x4b63…` increases its native BNB balance from `0.3930199406` BNB to `190.645061755431167874` BNB, a net delta of `+190.252041814831167874` BNB.
+  - WBNB contract `0xbb4c…` loses approximately `190.553117446131167874` BNB of native balance.
+  - USDT vault proxy `0xb8ad82…` experiences a large negative USDT balance delta, while addresses `0x13342140A62Cb51C052b5a70eb186f40a1725eBf` and `0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae` receive significant USDT inflows.
+- Public pre-state σ_B: The pre-state σ_B at block height `57780985` is publicly reconstructible from canonical on-chain data and the provided artifacts. It covers code and storage for:
+  - Orchestrator `0x3b3E…`, proxies `0x2Cc8…` and `0xb8ad82…`, implementations `0x13b5…`, `0x89a0…`, `0x1a1a84…`, router/pricing `0x94DD…`, PancakeV3Pool `0x92b7…`, PancakePair `0xaec5…`, BEP20USDT `0x55d3…`, and WBNB `0xbb4c…`.
+  - σ_B is justified by `metadata.json`, `state_diff_prestateTracer.json`, `balance_diff_prestateTracer.json`, and `data_collection_summary.json`.
 
-### 4.4 ACT exploit conditions
+## Vulnerability Analysis
 
-The ACT opportunity is fully determined by the public pre-state and holds whenever:
+- Advertised invariant: The custom token and vault stack implement an explicit same-block “Flash loan protection” invariant intended to prevent sell operations in the same block as a purchase. This is implemented through:
+  - Per-address tracking of recent block numbers.
+  - `require` guards that compare `storage_map_a[...]` values against `block.number` and include the revert string “Flash loan protection: cannot sell in the same block of purchase.” in multiple locations in the decompiled implementations.
+- Observed behavior: Despite the presence of this invariant:
+  - In block `57780985`, the orchestrator executes a flashloan-driven route that buys and sells via the proxy token and vault in a single transaction.
+  - The trace for tx `0x26bcefc1…` shows these operations completing successfully; no internal call reverts with the “Flash loan protection” message.
+  - State and balance diffs confirm a full cycle: USDT borrowed and later repaid with fee, proxy/vault balances updated, AMM reserves shifted, and attacker BNB profit realized.
+- Vulnerable components:
+  - Implementation `0x13b5ca6642d9c2309b4c34f8b591e35b629458fc` behind proxy `0x2Cc8B879E3663d8126fe15daDaaA6Ca8D964BbBE` (custom token implementation with embedded same-block trading restriction).
+  - Implementation `0x89a0af274e6244f781a50d632b222231ef7655eb` behind proxy `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99` (vault implementation holding large USDT balances and participating in the exploit route).
+  - Implementation `0x1a1a84b45d2fEeeC1B1726F5C1da7d3fe2f37041` and router/pricing contract `0x94DDCd7253AC864Ec77A2dDC2bE4B2418Ed17C9D`, which supply `price()`, `getAmountOut`, and `exchange` functionality used by the orchestrator.
+  - Orchestrator contract `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C`, which composes flashloan, vault, token, router and AMM interactions into a single exploit transaction.
+- Vulnerability summary: Under σ_B at block `57780985`, the anti-flashloan invariant encoded in the custom token/vault implementations does not apply to, or fails to enforce on, the contract-mediated routing path used by the orchestrator. As a result, a same-block buy-and-sell cycle that the system intends to block is permitted to execute and extract value from protocol-side balances.
 
-- Proxies `0xb8ad82c4…` and `0x2Cc8B8…` hold substantial BEP20USDT balances and delegatecall into implementation `0x1a1a84b4…` with the accounting behavior observed in the state diffs and disassembly.  
-- Helper contracts `0xCAC261…`, `0x6Ac39…`, and `0x4D85f6AF…` exist and are callable via router `0x3b3E1E…`, as shown by preparation transaction `0x27baa4c5…` traces and state diffs.  
-- Proxies and helpers expose public methods that allow an unprivileged EOA to arrange approvals, `transferFrom` calls, and swaps that move BEP20USDT from proxy `0xb8ad82c4…` into AMM pools and then into BNB, without a matching reduction of liabilities in the delegated storage of `0x1a1a84b4…`.  
-- Pancake V3 pool `0x92b7807b…` and pair `0x16b9a828…` provide enough BEP20USDT and WBNB liquidity to support the `20,000,000` USDT flash loan and swaps seen in the seed trace.
+## Detailed Root Cause Analysis
 
-Any unprivileged adversary with access to these public contracts, balances, and pools can reproduce the exploit.
+### Exploit transaction and trace
 
-## 5. Adversary Flow Analysis
+The seed and exploit transaction is:
 
-### 5.1 High-level strategy
+- Chain: BSC (chainid 56).
+- Transaction: `0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f`.
+- Sender (attacker EOA): `0x4b63c0cf524f71847ea05b59f3077a224d922e8d`.
+- To (orchestrator): `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C`.
+- Type: legacy type‑0, value `0`, gas limit `0x112a880`, gasPrice `0x5f5e100` (100,000,000 wei).
+- Block: `57780985` (0x371aaf9).
 
-The adversary uses a two-step strategy on BSC:
-
-1. **Helper deployment and configuration** – Transaction `0x27baa4c57686fb256aadecf3990cd750195a9cf7b778b908a4d9bbda091847e7` from EOA `0x4B63C0cf524F71847ea05B59F3077A224d922e8D` to router `0x3b3E1E…` deploys helper contracts (including `0xCAC261…` and `0x4D85f6AF…`) and configures them to delegatecall implementation `0x4beefd0F…`, establishing generic ERC20 `transferFrom` and swap sequencing capabilities.  
-2. **Flash-loan exploit and profit realization** – Transaction `0x26bcefc1…` executes a `20,000,000` BEP20USDT flash loan via pool `0x92b7807b…`, routes the borrowed USDT through helpers, proxies `0xb8ad82c4…` / `0x2Cc8B8…`, PancakeRouter `0x10ED43C7…`, and AMM pairs `0xaec58FBd7Ed8008A3742f6d4FFAA9F4B0ECbc30e` and `0x16b9a828…`, then repays `20,002,000` USDT and converts the residual USDT into BNB profit for the adversary cluster `{0x4B63…, 0x1266C6…}`.
-
-### 5.2 Adversary-related accounts
-
-**Adversary cluster**
-
-- `0x4B63C0cf524F71847ea05B59F3077A224d922e8D` (EOA, chain 56): sender of both preparation tx `0x27baa4c5…` and exploit tx `0x26bcefc1…`; prestateTracer native balance deltas and `adversary_net_profit_bnb.json` attribute the majority of the `~190.55` BNB profit to this address.  
-- `0x1266C6bE60392A8Ff346E8d5ECCd3E69dD9c5F20` (EOA, chain 56): recipient of `0.3` BNB in `0x26bcefc1…`, as shown in `balance_diff_prestate_tracer.json` and BEP20/WBNB traces; included in the profit-taking cluster in `adversary_net_profit_bnb.json`.  
-- `0xCAC261d08Cc190eA2BF271aaB40cf21EbCb30cbA` (contract, chain 56): helper deployed in `0x27baa4c5…` and called from router `0x3b3E1E…` in `0x26bcefc1…`; disassembly and traces show it delegatecalling `0x4beefd0F…` to perform ERC20 `transferFrom` operations.  
-- `0x6Ac39F58d3192CbBB4167BA3b559287D231eeBC7` (contract, chain 56): helper used alongside `0xCAC261…` to delegatecall `0x4beefd0F…`; the seed trace for `0x26bcefc1…` shows it called between router `0x3b3E1E…` and implementation `0x4beefd0F…` as an intermediate contract moving BEP20USDT.  
-- `0x4D85f6AF054A2271a15F8D3cF880Ba7b7497225F` (contract, chain 56): helper deployed in `0x27baa4c5…`; its disassembly shows sequencing of ERC20 `approve`, `transferFrom`, and router calls, used in `0x26bcefc1…` to move BEP20USDT through proxies and AMMs.  
-- `0x4beefd0F0064Cb8FAF045B989976A453ae983Da6` (contract, chain 56): helper implementation called via delegatecall from `0xCAC261…` and `0x6Ac39…`; disassembly shows function `0xe09618e9` constructing ERC20 `transferFrom` calls, enabling helpers to pull BEP20USDT from callers and route it through AMM pools.  
-- `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C` (contract, chain 56): router-like contract receiving both adversary-crafted transactions; `trace.cast.log` shows it orchestrating calls to helpers, proxies, PancakeRouter, and AMM pools.
-
-**Victim candidates**
-
-- `bsc-56-proxy-0xb8ad82c4` – proxy `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99` (verified), chain 56; loses `239,832,087.664667062923384` BEP20USDT units during the exploit.  
-- `bsc-56-proxy-0x2Cc8B8` – proxy `0x2Cc8B879E3663d8126fe15daDaaA6Ca8D964BbBE` (verified), chain 56; participates in the same delegated accounting scheme and exploitation path.
-
-### 5.3 Adversary lifecycle stages
-
-1. **Adversary funding**  
-   - Tx: `0x6d30be2a19261ae308142432132264a58d32181647ab7976b0f3bc830211c700` (BSC, block `58015697`).  
-   - Effect: EOA `0x4B63…` receives BNB from `0xbeeb28c202d00949c9cbec93cbcbe75476f851a1`, providing native tokens used to pay gas for later adversary-crafted transactions, as shown in `txlist_normal.json` for `0x4B63…`.  
-2. **Helper contracts deployment and configuration**  
-   - Tx: `0x27baa4c57686fb256aadecf3990cd750195a9cf7b778b908a4d9bbda091847e7` (BSC, block `57780130`).  
-   - Effect: router `0x3b3E1E…` deploys helpers including `0xCAC261…` and `0x4D85f6AF…` and configures them to delegatecall `0x4beefd0F…`, establishing flexible ERC20 `transferFrom` and swap sequencing for later use.  
-3. **Flash-loan exploit and profit realization**  
-   - Tx: `0x26bcefc1…` (BSC, block `57780985`).  
-   - Effect: executes a `20,000,000` BEP20USDT flash loan via pool `0x92b7807b…`, routes USDT through helpers, proxies `0xb8ad82c4…` / `0x2Cc8B8…`, PancakeRouter `0x10ED43C7…`, and AMM pairs `0xaec58FBd7Ed8008A3742f6d4FFAA9F4B0ECbc30e` and `0x16b9a828…`; repays `20,002,000` USDT and uses `162,050.884788503640076373` USDT to buy `190.553117446131167874` WBNB from pair `0x16b9a828…`. WBNB is unwrapped to BNB and distributed as `+190.253117446131167874` BNB to `0x4B63…` and `+0.3` BNB to `0x1266C6…`, with a matching `-190.553117446131167874` BNB delta on WBNB contract `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c` and a `-239,832,087.664667062923384` BEP20USDT delta on proxy `0xb8ad82c4…`.
-
-### 5.4 Trace evidence snippet
-
-Seed transaction `0x26bcefc1…` trace (Foundry `cast run -vvvvv` output) shows the flash loan from pool `0x92b7807b…` to router `0x3b3E1E…`, transfer of `20,000,000` USDT, and subsequent callback into the router, which then interacts with proxies and helpers:
+A key portion of the trace (from `trace.cast.log`) shows the flashloan and callback wiring:
 
 ```text
-Traces:
-  [13423023] 0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C::592d448f(...)
-    ├─ [13259861] 0x92b7807bF19b7DDdf89b706143896d05228f3121::flash(0x3b3E1E..., 20000000000000000000000000 [2e25], 0, ...)
-    │   ├─ [2531] BEP20USDT::balanceOf(0x92b7807bF19b7DDdf89b706143896d05228f3121) [staticcall]
-    │   ├─ [27971] BEP20USDT::transfer(0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C, 20000000000000000000000000 [2e25])
-    │   │   ├─ emit Transfer(from: 0x92b7807b..., to: 0x3b3E1E..., value: 20000000000000000000000000 [2e25])
-    │   ├─ [13185458] 0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C::pancakeV3FlashCallback(2000000000000000000000 [2e21], 0, ...)
-    │   │   ├─ [24562] BEP20USDT::approve(0xCAC261d08Cc190eA2BF271aaB40cf21EbCb30cbA, 12313575093686077974655 [1.231e22])
+0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C::592d448f(...)
+  ├─ PancakeV3Pool::flash(0x3b3E1Edeb7…, 20000000000000000000000000, 0, ...)
+  │   ├─ BEP20USDT::transfer(0x3b3E1Edeb7…, 20000000000000000000000000)
+  │   └─ ...
+  ├─ 0x3b3E1Edeb7…::pancakeV3FlashCallback(2000000000000000000000, 0, ...)
+  │   ├─ PancakeRouter::getAmountsIn(...)
+  │   ├─ TransparentUpgradeableProxy (0x2Cc8… / 0xb8ad82…) delegatecalls into
+  │   │   implementations 0x13b5… and 0x1a1a84… via router/pricing contract 0x94DD…
+  │   ├─ PancakeRouter::swapExactTokensForTokensSupportingFeeOnTransferTokens(...)
+  │   └─ PancakePair::swap(...) along the USDT–proxy pair 0xaec58F…
+  └─ ...
 ```
 
-This snippet illustrates the flash loan, transfer of USDT to the router, and approval to helper `0xCAC261…`, which is then used to route USDT through the proxies and AMMs while the proxy’s delegated storage remains unchanged.
+This trace shows that the orchestrator:
 
-## 6. Impact & Losses
+- Calls `PancakeV3Pool::flash` on `0x92b7…` to borrow `20,000,000 * 10^18` USDT.
+- In the flash callback, routes the borrowed USDT through:
+  - Vault proxy `0xb8ad82…` and token proxy `0x2Cc8…` via their implementations.
+  - Router/pricing contract `0x94DD…` and implementation `0x1a1a84…` to compute exchange amounts and carry out transfers.
+  - PancakeRouter and AMM pair `0xaec58F…` to perform swaps between USDT and the proxy token.
+- Repays the flashloan principal plus fee to `0x92b7…` before the transaction completes.
 
-**Total loss overview**
+Throughout this sequence, no call in the trace reverts with the “Flash loan protection: cannot sell in the same block of purchase.” message, despite the same-block buy-and-sell cycle.
 
-- Token: `BEP20USDT`  
-- Amount: `239,832,087.664667062923384` units  
+### Code-level invariant evidence
 
-**Impact details**
+Decompiled implementations for the token and vault logic explicitly embed the anti-flashloan invariant. For example, the decompiled contract for implementation `0x13b5ca6642d9c2309b4c34f8b591e35b629458fc` includes:
 
-- `balance_diff_prestate_tracer.json` for tx `0x26bcefc1…` shows that proxy `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99` loses `239,832,087.664667062923384` BEP20USDT units, while AMM pools and intermediaries receive matching positive BEP20USDT deltas.  
-- `adversary_net_profit_bnb.json` shows that the adversary cluster `{0x4B63…, 0x1266C6…}` realizes a net profit of `190.55096618353116` BNB after gas costs.  
-- The drain leaves the proxy-cluster economically undercollateralized and shifts losses onto holders whose positions are represented by the proxy’s delegated storage in implementation `0x1a1a84b4…`.
+```solidity
+require(storage_map_a[var_a] < block.number, "Flash loan protection: cannot sell in the same block of purchase.");
+require(!(storage_map_a[var_a] < block.number), "Flash loan protection: cannot sell in the same block of purchase.");
+```
 
-## 7. References
+Similar guards appear in implementation `0x1a1a84b45d2fEeeC1B1726F5C1da7d3fe2f37041`, which also tracks per-address data and applies constraints based on the difference between `block.number` and stored values. These snippets demonstrate that:
 
-**Primary incident metadata and ACT reconstruction**
+- The system attempts to encode a same-block restriction on sell-side flows after a purchase.
+- Violations of this invariant are intended to revert with the precise string “Flash loan protection: cannot sell in the same block of purchase.”.
 
-- Root cause report metadata:  
-  - Title: `BSC-56 BEP20USDT proxy-cluster drain via accounting bug`.  
-  - Protocol name: `bsc-56-proxy-cluster-0xb8ad82-0x2Cc8`.  
-  - `is_act = true`, `root_cause_category = "protocol_bug"`.  
-- ACT pre-state and reconstruction evidence:  
-  - Seed transaction trace and balance diff for `0x26bcefc1…`: `artifacts/root_cause/seed/56/0x26bcefc1…`.  
-  - PrestateTracer diffs and adversary profit calculation for `0x26bcefc1…` and `0x27baa4c5…`: `artifacts/root_cause/data_collector/iter_3/tx/56`.  
-  - Verified sources and disassemblies for BEP20USDT, WBNB, proxies, and helpers: `artifacts/root_cause/data_collector/iter_1/contract/56`.  
-  - Helper contracts disassemblies for `0xCAC261…`, `0x6Ac39…`, and `0x4D85f6AF…`: `artifacts/root_cause/data_collector/iter_2/contract/56`.
+### Evidence of invariant failure on the exploit path
 
-**root_cause.json section references**
+Combining trace and diff evidence:
 
-- `[1]` Seed transaction trace and balance diff for `0x26bcefc1…` – `artifacts/root_cause/seed/56/0x26bcefc1…`.  
-- `[2]` PrestateTracer diffs and adversary profit calculation for `0x26bcefc1…` and `0x27baa4c5…` – `artifacts/root_cause/data_collector/iter_3/tx/56`.  
-- `[3]` Verified sources and disassemblies for BEP20USDT, WBNB, proxies, and helpers – `artifacts/root_cause/data_collector/iter_1/contract/56`.  
-- `[4]` Helper contracts disassemblies for `0xCAC261…`, `0x6Ac39…`, and `0x4D85f6AF…` – `artifacts/root_cause/data_collector/iter_2/contract/56`.
+- The exploit transaction executes a USDT → proxy token purchase, intermediate routing through the vault and proxies, and a subsequent sell back through the same stack, all within block `57780985`.
+- The internal calls traverse the exact components that embed the anti-flashloan checks (`0x13b5…`, `0x1a1a84…`, `0x94DD…`), but the trace shows no revert carrying the “Flash loan protection” message.
+- `balance_diff.json` and `balance_diff_prestateTracer.json` show:
+  - Attacker EOA `0x4b63…` native BNB delta: `+190.252041814831167874` BNB.
+  - WBNB contract `0xbb4c…` native balance delta: `−190.553117446131167874` BNB.
+  - USDT vault proxy `0xb8ad82…` large negative USDT delta, while AMM and external addresses gain USDT.
+  - The USDT pool `0x92b7…` ends with a higher USDT balance due to the flash fee.
 
-This report is fully derived from and consistent with `root_cause.json`, seed transaction traces, prestateTracer outputs, and verified contract sources/disassemblies, and contains no speculative or undetermined content.
+This establishes that the invariant is not enforced on the contract-mediated route actually taken by the orchestrator under σ_B. The root cause is therefore:
+
+- The system’s same-block anti-flashloan protection, as deployed and configured at σ_B, does not cover the orchestrator’s flashloan-driven buy-and-sell path through the proxies, vault, router and AMM.
+- This gap enables a fully automated, single-transaction exploitation that conforms to all public interfaces but violates the intended invariant, resulting in deterministic attacker profit.
+
+### ACT opportunity characterization
+
+The act_opportunity description is fully satisfied:
+
+- Pre-state σ_B is public: All required code and storage for orchestrator, proxies, implementations, router, pool, AMM, USDT and WBNB are reconstructible from RPC, traces and the provided state-diff artifacts at block `57780985`.
+- Transaction sequence `b`: A single attacker-crafted transaction (`index: 1`) on chainid 56 with:
+  - From `0x4b63…` (unprivileged EOA).
+  - To `0x3b3E…` (orchestrator).
+  - Standard gas and gasPrice consistent with public network conditions.
+  - No private ordering or privileged access; the call sequence involves only public flashloan, proxy, router and AMM functions.
+- Inclusion feasibility: Any unprivileged EOA can submit the same calldata, gas and value on σ_B and have the transaction included under normal BSC rules, leading to the same trace.
+- Success predicate:
+  - Type: `profit` in reference asset BNB.
+  - Attacker address: `0x4b63c0cf524f71847ea05b59f3077a224d922e8d`.
+  - Value before: `0.3930199406` BNB.
+  - Value after: `190.645061755431167874` BNB.
+  - Net delta: `190.252041814831167874` BNB.
+  - Gas fees: already reflected in the net balance delta; the exact fee is not separately reported in the artifacts but is fully accounted for in the before/after values.
+
+Given these facts, this incident is an ACT opportunity: any unprivileged adversary with access to on-chain data and the exploit calldata could have reproduced the profit.
+
+## Adversary Flow Analysis
+
+### Strategy summary
+
+- The adversary strategy is a single-transaction flashloan exploit:
+  - Deploy a custom orchestrator contract capable of composing flashloan, vault, token and AMM interactions.
+  - Use the orchestrator to take a large USDT flashloan from PancakeV3Pool `0x92b7…`.
+  - Route the borrowed USDT through the proxy-based USDT vault and anti-flashloan token stack using router/pricing logic and the USDT–proxy AMM pair.
+  - Repay the flashloan principal and fee within the same transaction.
+  - Exit with a large BNB profit in the attacker EOA, funded by WBNB/native balance reductions and vault-side USDT movements.
+
+### Adversary-related accounts
+
+- Adversary cluster:
+  - EOA `0x4b63c0cf524f71847ea05b59f3077a224d922e8d`
+    - Role: Sender and gas payer of exploit transaction `0x26bcefc1…`.
+    - Evidence: `txlist_57779000_57782000.json` records this address as `from` for both the orchestrator deployment tx and the exploit tx.
+  - Orchestrator contract `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C`
+    - Role: Contract created by the attacker EOA and used as the target of the exploit transaction; executes the flashloan and routing logic.
+    - Evidence: Deployment transaction `0x36811c78469e63316f042c105dfc74a00a3df848efac12413df48ecad56cf2c6` has `to == ""` and `contractAddress == 0x3b3E…`; exploit tx `0x26bcefc1…` sends input `0x592d448f…` to this contract.
+
+- Victim and protocol-side components:
+  - BEP20USDT `0x55d398326f99059ff775485246999027b3197955`.
+  - WBNB `0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c`.
+  - PancakeV3Pool (USDT pool) `0x92b7807bF19b7DDdf89b706143896d05228f3121`.
+  - USDT–proxy AMM pair `0xaec58FBd7Ed8008A3742f6d4FFAA9F4B0ECbc30e`.
+  - USDT vault proxy `0xb8ad82c4771DAa852DdF00b70Ba4bE57D22eDD99`.
+  - Custom token proxy `0x2Cc8B879E3663d8126fe15daDaaA6Ca8D964BbBE`.
+  - These addresses act as liquidity reservoirs and routing components; balance and reserve changes at these contracts fund the attacker’s net BNB profit.
+
+### Lifecycle stages
+
+- Orchestrator Deployment
+  - Transaction: `0x36811c78469e63316f042c105dfc74a00a3df848efac12413df48ecad56cf2c6`.
+  - Block: `57779996`.
+  - Chain: BSC (56).
+  - Mechanism: `contract_deploy` from EOA `0x4b63…` with value `0`.
+  - Effect: Creates orchestrator contract `0x3b3E1Edeb726b52D5dE79cF8dD8B84995D9Aa27C` with logic to request flashloans and route funds.
+  - Evidence: `txlist_57779000_57782000.json` and orchestrator decompile (`0x3b3E…-decompiled.sol`).
+
+- Exploit Execution
+  - Transaction: `0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f`.
+  - Block: `57780985`.
+  - Chain: BSC (56).
+  - Mechanism: `flashloan+amm+vault_routing`.
+  - Effect:
+    - Orchestrator calls PancakeV3Pool `0x92b7…::flash` to borrow `20,000,000 * 10^18` USDT.
+    - In the callback, it uses router/pricing `0x94DD…` and implementation `0x1a1a84…` to calculate path amounts and exchange USDT for the proxy token via proxies `0x2Cc8…` / `0xb8ad82…` and AMM pair `0xaec58F…`.
+    - It performs a same-block buy-and-sell cycle for the proxy token, moving value out of vault-held USDT and AMM reserves.
+    - It repays the flashloan principal and fee to the USDT pool.
+    - The attacker EOA’s BNB balance increases by `190.252041814831167874` BNB.
+  - Evidence:
+    - Trace: `artifacts/root_cause/seed/56/0x26bcefc1…/trace.cast.log`.
+    - Balance diffs: `balance_diff.json` and `balance_diff_prestateTracer.json`.
+    - State diffs: `state_diff_prestateTracer.json`, including focus slices for proxies and implementations.
+    - Decompiles for `0x13b5…`, `0x89a0…`, `0x1a1a84…`, and `0x94DD…`.
+
+## Impact & Losses
+
+- Attacker BNB profit:
+  - Native balance for EOA `0x4b63…` increases from `0.3930199406` BNB to `190.645061755431167874` BNB.
+  - Net delta: `+190.252041814831167874` BNB.
+  - This delta is already net of gas costs, as it is taken directly from before/after native balance readings in `balance_diff.json`.
+- WBNB losses:
+  - WBNB contract `0xbb4c…` native balance decreases by `190.553117446131167874` BNB.
+  - This indicates that WBNB-related liquidity providers effectively fund the attacker’s BNB profit (together with shifts in USDT).
+- USDT flows:
+  - USDT vault proxy `0xb8ad82…` suffers a large negative USDT balance delta, reflecting outflows of vault-held USDT.
+  - USDT AMM pair `0xaec58F…` and external addresses:
+    - `0x13342140A62Cb51C052b5a70eb186f40a1725eBf` receives `+39,668,885,677,805,882,830,887` USDT (in token units).
+    - `0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae` receives `+162,050,884,788,503,640,076,373` USDT.
+  - PancakeV3Pool `0x92b7…` ends with a net `+2,000,000,000,000,000,000,000` USDT delta due to the flash fee.
+- Economic incidence:
+  - The net BNB gains for the attacker are mirrored by WBNB contract native balance losses and USDT redistributions out of the vault.
+  - The immediate economic losses therefore fall on:
+    - WBNB liquidity providers whose reserves are drawn down.
+    - USDT vault participants whose vault-held USDT is partially drained or reallocated.
+  - The flashloan pool itself is not harmed; it receives its principal plus fee and ends with higher USDT balance.
+
+## References
+
+- [1] Exploit transaction metadata and trace  
+  `artifacts/root_cause/seed/56/0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f`
+
+- [2] Balance and state diffs (prestateTracer)  
+  `artifacts/root_cause/data_collector/iter_2/tx/56/0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f`
+
+- [3] Contract sources and decompiles for orchestrator, proxies, implementations, router, pool and AMM  
+  `artifacts/root_cause/data_collector`
+
+- [4] Attacker EOA txlist around exploit and orchestrator deployment  
+  `artifacts/root_cause/data_collector/iter_2/address/56/0x4b63c0cf524f71847ea05b59f3077a224d922e8d/txlist_57779000_57782000.json`
+
+- [5] Relevant transactions (BSC chainid 56)  
+  - Orchestrator deployment (related): `0x36811c78469e63316f042c105dfc74a00a3df848efac12413df48ecad56cf2c6`  
+  - Exploit transaction (attacker-crafted): `0x26bcefc152d8cd49f4bb13a9f8a6846be887d7075bc81fa07aa8c0019bd6591f`
 
