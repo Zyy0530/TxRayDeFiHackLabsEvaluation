@@ -1,0 +1,8 @@
+{
+  "incident_dir": "/home/ziyue/TxRayExperiment/slack-incident-C0A267R7RH8-1766552897_358099_20251224_051005_755930Z",
+  "incident_name": "slack-incident-C0A267R7RH8-1766552897_358099_20251224_051005_755930Z",
+  "incident_timestamp": 1766552897358099,
+  "raw_json": "/home/ziyue/TxRayExperiment/slack-incident-C0A267R7RH8-1766552897_358099_20251224_051005_755930Z/standardized_txs.json",
+  "formatted_txt_file": "2024-10_SASHAToken.txt",
+  "formatted_txt_path": "/home/ziyue/TxRayExperiment/formatted_txt/2024-10_SASHAToken.txt"
+}

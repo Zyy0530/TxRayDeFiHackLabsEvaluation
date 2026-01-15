@@ -1,0 +1,8 @@
+{
+  "incident_dir": "/home/ziyue/TxRayExperiment/incident-202512301029",
+  "incident_name": "incident-202512301029",
+  "incident_timestamp": 1767090540000000,
+  "raw_json": "/home/ziyue/TxRayExperiment/incident-202512301029/raw.json",
+  "formatted_txt_file": "2025-05_Unwarp.txt",
+  "formatted_txt_path": "/home/ziyue/TxRayExperiment/formatted_txt/2025-05_Unwarp.txt"
+}
